@@ -1,0 +1,11 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "promptregress"
+version = "0.1.0"
+description = "Pytest for prompts: catch LLM regressions before your users do."
+readme = "README.md"
+requires-python = ">=3.10"
+[project.scripts]
+promptregress = "promptregress.cli:main"
