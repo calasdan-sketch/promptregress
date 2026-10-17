@@ -1,10 +1,11 @@
 """Runner: execute cases against a prompt version, with caching.
 
-Cache (.promptregress/cache/) is keyed by prompt text + case + model, so
+Cache (.promptregress/cache/) is keyed by prompt text + case + model +
+provider base URL, so
 `diff v1 v2` never pays for the same call twice and CI re-runs are cheap.
 
 LLM-judge verdicts are cached too, keyed by (prompt version, case name,
-output hash) — a second identical run never re-pays the judge. Transient
+output hash, judge model + base URL) — a second identical run never re-pays the judge. Transient
 judge outages are never cached: only real verdicts are stored.
 """
 
@@ -71,12 +72,20 @@ def _cache_put(root: str, key: str, output: str) -> None:
         json.dump({"output": output}, f)
 
 
+def _provider(model_kw: dict) -> tuple[str, str]:
+    """(model, base_url) actually used for model_kw, env defaults applied."""
+    cfg = model_mod._cfg(model_kw.get("base_url"), None,
+                         model_kw.get("model"))
+    return cfg["model"], cfg["base_url"]
+
+
 def _judge_key(prompt_name: str, version: str, case_name: str,
-               output: str, rubric: str) -> str:
+               output: str, rubric: str, provider: str = "") -> str:
     """Cache key for a judge verdict. Includes the rubric so two cases
-    that share a name but judge different things never collide."""
+    that share a name but judge different things never collide, and the
+    judge's model + base URL so another judge's verdict is never reused."""
     h = hashlib.sha256()
-    for part in (prompt_name, version, case_name, rubric):
+    for part in (prompt_name, version, case_name, rubric, provider):
         h.update(part.encode("utf-8"))
         h.update(b"\x00")
     h.update(hashlib.sha256(output.encode("utf-8")).digest())
@@ -106,10 +115,9 @@ def _judge_cache_put(root: str, key: str, passed: bool,
 def run_case(root: str, prompt_name: str, version: str, prompt_text: str,
              case: dict, model_kw: dict, use_cache: bool = True,
              judge_model_kw: dict | None = None) -> CaseResult:
-    model_name = (model_kw.get("model")
-                  or os.environ.get("PROMPTREGRESS_MODEL") or "llama3.1")
+    model_name, base_url = _provider(model_kw)
     key = suite_mod.cache_key(prompt_name, version, prompt_text, case,
-                              model_name)
+                              model_name, base_url)
     cached = False
     if use_cache:
         hit = _cache_get(root, key)
@@ -123,7 +131,8 @@ def run_case(root: str, prompt_name: str, version: str, prompt_text: str,
         except model_mod.ModelError as e:
             return CaseResult(name=case["name"], passed=False, output="",
                               assertions=[], error=str(e))
-        _cache_put(root, key, output)
+        if use_cache:  # same contract as judge verdicts: off = no I/O
+            _cache_put(root, key, output)
 
     results: list[AssertionResult] = []
     for assertion in case["assert"]:
@@ -131,7 +140,8 @@ def run_case(root: str, prompt_name: str, version: str, prompt_text: str,
             spec = assertion["judge"]
             rubric = spec["rubric"] if isinstance(spec, dict) else spec
             jkey = _judge_key(prompt_name, version, case["name"],
-                              output, rubric)
+                              output, rubric,
+                              "|".join(_provider(judge_model_kw or model_kw)))
             hit = _judge_cache_get(root, jkey) if use_cache else None
             if hit is not None:
                 passed, detail = hit

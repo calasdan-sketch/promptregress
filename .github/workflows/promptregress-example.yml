@@ -1,0 +1,37 @@
+# Copy this file into your repo's .github/workflows/ to run promptregress
+# on every push and pull request.
+#
+# It uses --demo, so CI never needs a live model or API key. Demo mode
+# answers with a built-in fake model that only knows the example
+# `sentiment` prompt scaffolded by `promptregress init` (it is scaffolded
+# into a temp dir if your repo has none), so this checks the install and
+# wiring - not your own prompts' quality.
+#
+# To gate on your real prompts, add repo secrets for a model the runner
+# can reach and use the commented step instead.
+name: promptregress (example)
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  prompts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install promptregress (stdlib only, no other dependencies)
+        run: pip install git+https://github.com/calasdan-sketch/promptregress
+      - name: Prompt regression tests (demo mode, fake model)
+        run: promptregress --demo run --prompt sentiment --version v1
+      # Real model instead of the demo (exit 1 = a case failed,
+      # exit 2 = model unreachable / bad cases file):
+      # - name: Prompt regression tests
+      #   env:
+      #     PROMPTREGRESS_BASE_URL: ${{ secrets.PROMPTREGRESS_BASE_URL }}
+      #     PROMPTREGRESS_API_KEY: ${{ secrets.PROMPTREGRESS_API_KEY }}
+      #     PROMPTREGRESS_MODEL: llama3.1
+      #   run: promptregress run --prompt <your-prompt> --version v2 --no-cache

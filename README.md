@@ -6,8 +6,16 @@ YAML, run them in CI, and diff versions A/B before you ship.
 
 ## Install
 
+Zero dependencies — Python 3.10+ stdlib only.
+
 ```bash
-git clone <repo> && cd prompt-regress
+pip install git+https://github.com/calasdan-sketch/promptregress
+```
+
+Or from a clone:
+
+```bash
+git clone https://github.com/calasdan-sketch/promptregress && cd promptregress
 pip install .   # puts the `promptregress` console script on PATH
 ```
 
@@ -16,10 +24,9 @@ Or run without installing: `python3 -m promptregress` from the repo root.
 ## Quick start
 
 ```bash
-pip install .                                            # puts `promptregress` on PATH
 promptregress init                                       # scaffold prompts/ with an example
-promptregress --demo run --prompt summarize --version v1 # zero-setup trial, no model needed
-promptregress --demo diff v1 v2 --prompt summarize        # A/B on the same golden cases
+promptregress --demo run --prompt sentiment --version v1 # zero-setup trial, no model needed
+promptregress --demo diff v1 v2 --prompt sentiment       # A/B on the same golden cases
 promptregress list
 ```
 
@@ -27,15 +34,19 @@ promptregress list
 whole workflow with zero dependencies — no Ollama, no API key. Drop the flag
 once `PROMPTREGRESS_BASE_URL` points at your real endpoint (see below).
 
-(Haven't run `pip install .` yet? Prefix every command with `python3 -m`
+The example `sentiment` prompt is a one-word sentiment classifier
+(`sentiment.v1.txt`, `sentiment.v2.txt`, `sentiment.cases.yaml`); a run
+prints `sentiment.v1: ...` followed by `3/3 passed`.
+
+(Haven't installed it yet? Prefix every command with `python3 -m`
 from the repo checkout, e.g. `python3 -m promptregress init`.)
 
 ## Layout
 
 ```
-prompts/cls.v1.txt          prompt version 1 ({{input}} placeholder)
-prompts/cls.v2.txt          prompt version 2
-prompts/cls.cases.yaml      golden cases shared across versions
+prompts/<name>.v1.txt       prompt version 1 ({{input}} placeholder)
+prompts/<name>.v2.txt       prompt version 2
+prompts/<name>.cases.yaml   golden cases shared across versions
 ```
 
 ## Golden cases
@@ -56,8 +67,23 @@ cases:
           type: object
           required: [sentiment]
           properties:
-            sentiment: {type: string, enum: [positive, negative, neutral]}
+            sentiment:
+              type: string
+              enum: [positive, negative, neutral]
+  - name: long review
+    input: |
+      Arrived late.
+      Box was crushed and the manual was missing.
+    assert:
+      - contains: negative
 ```
+
+Multi-line inputs use YAML block scalars: literal `|` keeps line breaks,
+folded `>` joins lines with spaces; add `-` to strip or `+` to keep trailing
+newlines (`|-`, `>+`). The cases file is read by a small built-in YAML
+subset parser (no PyYAML needed); anchors, aliases, tags, flow maps
+(`{...}` as a value) and explicit indentation indicators (`|2`) are
+rejected with a line-numbered error.
 
 ## Assertions (deterministic, no LLM)
 
@@ -91,19 +117,31 @@ instead of pretending.
 ## Caching
 
 Responses are cached in `.promptregress/cache/` keyed by prompt text + case
-+ model — `diff v1 v2` never pays twice and CI re-runs are cheap.
++ model + base URL — `diff v1 v2` never pays twice and CI re-runs are cheap,
+and pointing at a different endpoint never reuses another provider's answers.
 LLM-judge verdicts are cached alongside, keyed by prompt version + case +
-output hash, so a re-run never re-pays the judge either (transient judge
-outages are reported, never cached). `--no-cache` forces fresh calls.
+output hash + judge model/base URL, so a re-run never re-pays the judge
+either (transient judge outages are reported, never cached). `--no-cache`
+forces fresh calls and writes nothing; `--demo` never reads or writes the
+cache, so fake-model answers can't make a later real run pass.
 
 ## CI
 
 ```bash
-promptregress run --prompt cls --version v2 --format json
+promptregress run --prompt sentiment --version v2 --format json
 ```
 
 Exit 1 on any failing case (human and `--format json` alike), 2 on errors
 (missing prompt, malformed cases YAML, unreachable model).
+
+Ready-to-copy GitHub Actions workflow:
+[`.github/workflows/promptregress-example.yml`](.github/workflows/promptregress-example.yml).
+It runs in `--demo` mode only, so CI never depends on a live model — but
+demo mode answers with a fake model that only knows the scaffolded
+`sentiment` example, so it checks the install and wiring, not your
+prompts. To gate on real prompts, point `PROMPTREGRESS_BASE_URL` (and
+`PROMPTREGRESS_API_KEY`) at a model reachable from the runner via repo
+secrets and drop `--demo` (commented step in the file).
 
 ## Why not Langfuse / LangSmith / Braintrust?
 
@@ -117,5 +155,9 @@ GitHub (17 repos). `promptregress` is clear on PyPI and npm.
 
 ## Tests
 
-37/37 pass: `python3 -m unittest discover -s tests`
+69/69 pass: `python3 -m unittest discover -s tests`
 (free — tests run against a fake in-process model server, no API spend)
+
+## License
+
+MIT — see [LICENSE](LICENSE).

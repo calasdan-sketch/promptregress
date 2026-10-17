@@ -104,6 +104,45 @@ class TestRunner(unittest.TestCase):
             except Exception:
                 pass
 
+    def test_cache_scoped_to_base_url(self):
+        # Same model name at a different provider address must not be
+        # served from the first provider's cache.
+        tmp = tempfile.mkdtemp()
+        make_suite(tmp)
+        server, url = start_fake_model({"terrible": "negative",
+                                        "great": "positive"})
+        try:
+            runner_mod.run_suite(tmp, "cls", "v1", model_kw={
+                "base_url": url, "api_key": "x", "model": "fake"})
+        finally:
+            server.shutdown()
+        results, _ = runner_mod.run_suite(tmp, "cls", "v1", model_kw={
+            "base_url": "http://127.0.0.1:1/v1", "api_key": "x",
+            "model": "fake"})
+        self.assertFalse(any(r.cached for r in results))
+        self.assertFalse(any(r.passed for r in results))
+        self.assertTrue(all(r.error for r in results))
+
+    def test_judge_cache_scoped_to_judge_provider(self):
+        tmp = tempfile.mkdtemp()
+        make_judge_suite(tmp)
+        s1, u1 = start_fake_model({"You are a strict test judge": "PASS"})
+        s2, u2 = start_fake_model({"You are a strict test judge": "FAIL"})
+        try:
+            r1, _ = runner_mod.run_suite(tmp, "cls", "v1", model_kw={
+                "base_url": u1, "model": "fake"})
+            self.assertTrue(r1[0].passed)
+            prompt = suite_mod.load_prompt(tmp, "cls", "v1")
+            case = suite_mod.load_cases(tmp, "cls")[0]
+            r2 = runner_mod.run_case(
+                tmp, "cls", "v1", prompt, case,
+                {"base_url": u1, "model": "fake"},
+                judge_model_kw={"base_url": u2, "model": "fake"})
+            self.assertFalse(r2.passed)  # judge 2's own verdict
+        finally:
+            s1.shutdown()
+            s2.shutdown()
+
     def test_failure_detail(self):
         tmp = tempfile.mkdtemp()
         make_suite(tmp)
@@ -345,7 +384,7 @@ class TestCLI(unittest.TestCase):
         # Zero-dependency trial: empty dir, no model server needed.
         tmp = tempfile.mkdtemp()
         os.environ.pop("PROMPTREGRESS_BASE_URL", None)
-        code, out = self._run(tmp, "--demo", "run", "--prompt", "summarize",
+        code, out = self._run(tmp, "--demo", "run", "--prompt", "sentiment",
                               "--version", "v1")
         self.assertEqual(code, 0)
         self.assertIn("3/3 passed", out)
@@ -366,9 +405,31 @@ class TestCLI(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         os.environ.pop("PROMPTREGRESS_BASE_URL", None)
         code, out = self._run(tmp, "--demo", "diff", "v1", "v2",
-                              "--prompt", "summarize")
+                              "--prompt", "sentiment")
         self.assertEqual(code, 0)
         self.assertIn("0/3 case(s) changed", out)
+
+    def test_demo_run_never_feeds_real_run_cache(self):
+        # HIGH regression: --demo wrote fake-model answers into the real
+        # cache (key ignored base_url), so a later real run with no model
+        # reachable passed from cache.
+        tmp = tempfile.mkdtemp()
+        cli_mod.scaffold_example(tmp)
+        os.environ.pop("PROMPTREGRESS_BASE_URL", None)
+        code, out = self._run(tmp, "--demo", "run", "--prompt", "sentiment",
+                              "--version", "v1")
+        self.assertEqual(code, 0)
+        self.assertIn("3/3 passed", out)
+        self.assertFalse(os.path.exists(
+            os.path.join(tmp, ".promptregress", "cache")))
+        out_buf, err_buf = io.StringIO(), io.StringIO()
+        with redirect_stdout(out_buf), redirect_stderr(err_buf):
+            code = cli_mod.main(["--root", tmp, "--base-url",
+                                 "http://127.0.0.1:1/v1", "run", "--prompt",
+                                 "sentiment", "--version", "v1"])
+        self.assertEqual(code, 2)
+        self.assertIn("model unreachable", err_buf.getvalue())
+        self.assertNotIn("passed", out_buf.getvalue())
 
     def test_missing_prompt(self):
         tmp = tempfile.mkdtemp()

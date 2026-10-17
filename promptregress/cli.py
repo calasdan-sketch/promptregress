@@ -4,8 +4,8 @@ Prompts are versioned files; golden cases live in YAML. Run them in CI,
 diff versions A/B, and catch prompt drift before your users do.
 
   python3 -m promptregress init
-  python3 -m promptregress --demo run --prompt summarize --version v1
-  python3 -m promptregress diff v1 v2 --prompt summarize
+  python3 -m promptregress --demo run --prompt sentiment --version v1
+  python3 -m promptregress diff v1 v2 --prompt sentiment
   python3 -m promptregress list
 
 (--demo trials the suite against a built-in fake model; after
@@ -59,7 +59,7 @@ INIT_CASES = """cases:
     input: "Absolutely love it, works perfectly!"
     assert:
       - contains: positive
-  - name: json shape
+  - name: neutral review
     input: "It's fine, nothing special."
     assert:
       - regex: (?i)\\bpositive\\b|\\bnegative\\b|\\bneutral\\b
@@ -72,9 +72,9 @@ def scaffold_example(root: str) -> list[str]:
     d = os.path.join(root, "prompts")
     os.makedirs(d, exist_ok=True)
     written = []
-    for fn, content in [("summarize.v1.txt", INIT_PROMPT_V1),
-                        ("summarize.v2.txt", INIT_PROMPT_V2),
-                        ("summarize.cases.yaml", INIT_CASES)]:
+    for fn, content in [("sentiment.v1.txt", INIT_PROMPT_V1),
+                        ("sentiment.v2.txt", INIT_PROMPT_V2),
+                        ("sentiment.cases.yaml", INIT_CASES)]:
         p = os.path.join(d, fn)
         if not os.path.exists(p):
             with open(p, "w") as f:
@@ -154,12 +154,18 @@ def _print_run(name: str, version: str,
     return 0 if not failed else 1
 
 
+def _use_cache(args) -> bool:
+    # --demo never reads or writes the cache: fake-model answers must not
+    # be able to make a later real run pass.
+    return not (args.no_cache or args.demo)
+
+
 def cmd_run(args) -> int:
     root = _demo_root(args) if args.demo else args.root
     try:
         results, _ = runner_mod.run_suite(
             root, args.prompt, args.version,
-            model_kw=_model_kw(args), use_cache=not args.no_cache)
+            model_kw=_model_kw(args), use_cache=_use_cache(args))
     except (FileNotFoundError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -177,10 +183,10 @@ def cmd_diff(args) -> int:
     try:
         r1, _ = runner_mod.run_suite(root, args.prompt, args.v1,
                                      model_kw=kw,
-                                     use_cache=not args.no_cache)
+                                     use_cache=_use_cache(args))
         r2, _ = runner_mod.run_suite(root, args.prompt, args.v2,
                                      model_kw=kw,
-                                     use_cache=not args.no_cache)
+                                     use_cache=_use_cache(args))
     except (FileNotFoundError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2

@@ -4,15 +4,19 @@ Handles the subset these tools need:
   - block mappings and lists, nested by indentation
   - inline-map list items ("- key: value")
   - flow-style lists of scalars ("[a, b]")
+  - block scalars: literal "|" and folded ">", with "-" (strip) and "+"
+    (keep) chomping, as a mapping value or list item
   - scalars: quoted strings, ints, floats, bools, null
   - "#" comments (outside quotes)
 
 SHARED COPY: the canonical version lives here in adr_drift/miniyaml.py.
 pr_verify and promptregress carry verbatim copies (see their headers).
 Do not fork — fix the canonical copy and re-copy.
+(promptregress copy is ahead: it adds | and > block scalars — port them
+to the canonical copy.)
 
-NOT supported (raises ValueError): anchors, aliases, tags, multi-line
-(|, >) scalars, flow maps, duplicate keys. Configs using them get a
+NOT supported (raises ValueError): anchors, aliases, tags, block-scalar
+indentation indicators ("|2"), flow maps, duplicate keys. Configs using them get a
 clear error naming the feature and the line number.
 
 Strictness notes:
@@ -29,6 +33,10 @@ from __future__ import annotations
 import re
 
 _KEY_RE = re.compile(r"^([A-Za-z0-9_.\-/ ]+):(?:\s|$)")
+# "key: |", "- >-", "- key: |+" ... -> (prefix, style, header flags)
+_BLOCK_RE = re.compile(r"^(- +(?:[A-Za-z0-9_.\-/ ]+: +)?|[A-Za-z0-9_.\-/ ]+: +)"
+                       r"([|>])([-+0-9]*)$")
+_BLOCK_TAG = "\x00block:"
 
 #: Deepest block-nesting level accepted. Deeper input raises ValueError
 #: (the parser's error contract) instead of RecursionError.
@@ -163,10 +171,75 @@ def _flow_list(s: str, lineno: int) -> list:
     return out
 
 
+def _fold(lines: list[str]) -> str:
+    """Folded (>) style: single breaks between plain lines become spaces;
+    blank lines and more-indented lines keep their breaks."""
+    out, prev, empties = [], None, 0
+    for ln in lines:
+        if not ln:
+            empties += 1
+            continue
+        if prev is None:
+            out.append("\n" * empties)
+        elif empties == 0 and ln[0] != " " and prev[0] != " ":
+            out.append(" ")
+        elif ln[0] != " " and prev[0] != " ":
+            out.append("\n" * empties)
+        else:
+            out.append("\n" * (empties + 1))
+        out.append(ln)
+        prev, empties = ln, 0
+    return "".join(out)
+
+
+def _block_scalar(raw_lines, i, parent_indent, style, chomp):
+    """Read block-scalar body lines after raw_lines[i-1]. Returns
+    (value, index of the first line after the block)."""
+    body, n = [], len(raw_lines)
+    while i < n:
+        ln = raw_lines[i].rstrip()
+        if ln and len(ln) - len(ln.lstrip(" ")) <= parent_indent:
+            break
+        body.append(ln)
+        i += 1
+    content = [ln for ln in body if ln.strip()]
+    ind = min((len(ln) - len(ln.lstrip(" ")) for ln in content[:1]),
+              default=0)
+    lines = []
+    for k, ln in enumerate(body):
+        if ln.strip() and len(ln) - len(ln.lstrip(" ")) < ind:
+            raise _err("block scalar line is less indented than its first "
+                       "line", i - len(body) + k + 1)
+        lines.append(ln[ind:])
+    trailing = 0
+    while lines and not lines[-1]:
+        lines.pop()
+        trailing += 1
+    text = "\n".join(lines) if style == "|" else _fold(lines)
+    if chomp == "-" or not lines:
+        return (text + "\n" * trailing if chomp == "+" else text), i
+    return text + "\n" + ("\n" * trailing if chomp == "+" else ""), i
+
+
+def _resolve(obj, blocks):
+    if isinstance(obj, dict):
+        return {k: _resolve(v, blocks) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_resolve(v, blocks) for v in obj]
+    if isinstance(obj, str) and obj.startswith(_BLOCK_TAG):
+        return blocks[int(obj[len(_BLOCK_TAG):])]
+    return obj
+
+
 def safe_load(text: str):
     # items: (line number, indent, content)
-    items = []
-    for lineno, raw in enumerate(text.splitlines(), 1):
+    items, blocks = [], []
+    raw_lines = text.splitlines()
+    i = 0
+    while i < len(raw_lines):
+        raw = raw_lines[i]
+        i += 1
+        lineno = i
         line = _strip_comment(raw).rstrip()
         if not line.strip():
             continue
@@ -176,6 +249,20 @@ def safe_load(text: str):
         content = line.strip()
         if content in ("---", "..."):
             continue
+        m = _BLOCK_RE.match(content)
+        if m:
+            prefix, style, chomp = m.groups()
+            if chomp not in ("", "-", "+"):
+                raise _err("block scalar indentation indicators "
+                           f"({style}{chomp}) are not supported", lineno)
+            # "- key: |": the body must be indented past the key, not
+            # just past the dash.
+            parent = indent
+            if prefix.startswith("-") and ":" in prefix:
+                parent += len(prefix) - len(prefix[1:].lstrip(" "))
+            value, i = _block_scalar(raw_lines, i, parent, style, chomp)
+            content = f"{prefix}{_BLOCK_TAG}{len(blocks)}"
+            blocks.append(value)
         items.append((lineno, indent, content))
     if not items:
         return None
@@ -183,7 +270,7 @@ def safe_load(text: str):
     if pos != len(items):
         lineno, _, content = items[pos]
         raise _err(f"unexpected content: {content!r}", lineno)
-    return val
+    return _resolve(val, blocks) if blocks else val
 
 
 def _parse_block(items, pos, indent, depth):

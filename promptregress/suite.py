@@ -28,7 +28,7 @@ PROMPTS_DIR = "prompts"
 
 def list_prompts(root: str, prompts_dir: str = PROMPTS_DIR
                  ) -> dict[str, list[str]]:
-    """name -> sorted version list, e.g. {'summarize': ['v1', 'v2']}."""
+    """name -> sorted version list, e.g. {'sentiment': ['v1', 'v2']}."""
     d = os.path.join(root, prompts_dir)
     found: dict[str, list[str]] = {}
     if not os.path.isdir(d):
@@ -83,13 +83,15 @@ def load_cases(root: str, name: str,
 
 
 def cache_key(name: str, version: str, prompt_text: str,
-              case: dict, model: str) -> str:
+              case: dict, model: str, base_url: str = "") -> str:
+    """base_url is part of the provider's identity: the same model name at
+    a different address (fake demo server, other host) is a different
+    model and must never share cached outputs."""
     h = hashlib.sha256()
-    h.update(name.encode())
-    h.update(version.encode())
-    h.update(prompt_text.encode())
-    h.update(json_dumps(case).encode())
-    h.update(model.encode())
+    for part in (name, version, prompt_text, json_dumps(case), model,
+                 base_url):
+        h.update(part.encode())
+        h.update(b"\x00")
     return h.hexdigest()[:32]
 
 
