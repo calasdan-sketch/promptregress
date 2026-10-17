@@ -131,6 +131,49 @@ class TestQuotedScalars(unittest.TestCase):
                          {"a": "# not a comment"})
 
 
+class TestSingleQuoteEscape(unittest.TestCase):
+    # YAML: inside 'single quotes' a doubled apostrophe ('') is one ('),
+    # so 'it''s' is it's. It used to come back as it''s. Expected values
+    # match PyYAML 6. Nothing else about single quotes changes.
+    def test_doubled_quote_is_one_apostrophe(self):
+        load = miniyaml.safe_load
+        self.assertEqual(load("a: 'it''s'"), {"a": "it's"})
+        self.assertEqual(load("a: 'say ''hi'''"), {"a": "say 'hi'"})
+        self.assertEqual(load("a: ''''"), {"a": "'"})
+        self.assertEqual(load("a: '''x'"), {"a": "'x"})
+        self.assertEqual(load("a: 'x'''"), {"a": "x'"})
+        self.assertEqual(load("a: ''"), {"a": ""})
+
+    def test_in_lists_and_inline_maps(self):
+        load = miniyaml.safe_load
+        self.assertEqual(load("- 'it''s'"), ["it's"])
+        self.assertEqual(load("- key: 'it''s'\n  other: 1"),
+                         [{"key": "it's", "other": 1}])
+        self.assertEqual(load("a: ['it''s', 'b, c', d]"),
+                         {"a": ["it's", "b, c", "d"]})
+
+    def test_doubled_quote_does_not_end_the_scalar(self):
+        # the '#' after '' is still inside the quotes; the one after the
+        # closing quote starts a comment
+        load = miniyaml.safe_load
+        self.assertEqual(load("a: 'it''s # not a comment' # a comment"),
+                         {"a": "it's # not a comment"})
+        self.assertEqual(load("a: 'it''s: fine'"), {"a": "it's: fine"})
+
+    def test_nothing_else_changes(self):
+        load = miniyaml.safe_load
+        # backslashes stay literal in single quotes
+        self.assertEqual(load("a: 'no \\n escape'"), {"a": "no \\n escape"})
+        # a double-quoted scalar keeps '' as two apostrophes
+        self.assertEqual(load("a: \"it''s\""), {"a": "it''s"})
+        # double quotes inside single quotes, and a single apostrophe
+        # inside double quotes, are untouched
+        self.assertEqual(load("a: 'say \"hi\"'"), {"a": 'say "hi"'})
+        self.assertEqual(load("a: \"it's\""), {"a": "it's"})
+        # a plain (unquoted) scalar is not single-quoted
+        self.assertEqual(load("a: it''s"), {"a": "it''s"})
+
+
 class TestBlockScalars(unittest.TestCase):
     # Expected values match PyYAML 6 on the same documents.
     def test_literal_clip(self):

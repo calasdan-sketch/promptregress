@@ -123,7 +123,8 @@ Multi-line inputs use YAML block scalars: literal `|` keeps line breaks
 (and trailing spaces), folded `>` joins lines with spaces; add `-` to strip
 or `+` to keep trailing newlines (`|-`, `>+`). Double-quoted strings take
 the JSON escapes (`"line1\nline2"`, `\t`, `\"`, `\\`, `\u00e9`); single-quoted
-strings are literal. The cases file is read by a small built-in YAML subset
+strings are literal, except that `''` is one apostrophe (`'it''s'` is
+`it's`). The cases file is read by a small built-in YAML subset
 parser (no PyYAML needed); anchors, aliases, tags, flow maps (`{...}` as a
 value) and explicit indentation indicators (`|2`) are rejected with a
 line-numbered error.
@@ -166,8 +167,12 @@ override env; they are accepted before or after the subcommand
 mean the same). Temperature is 0 for determinism. If the model cannot be
 used, `run`/`diff` exit 2 with the real reason instead of an all-FAIL
 table — `model unreachable at …`, `answered HTTP 401 Unauthorized: Invalid
-API key`, `answered HTTP 404 Not Found`, `timed out after 60s` — and stop
-at that case: a hung endpoint costs one timeout, not one per case.
+API key`, `answered HTTP 404 Not Found`, `timed out after 60s`, `answered
+without any text (content is null; it refused: …)` — and stop at that
+case: a hung endpoint costs one timeout, not one per case. Replies that
+are cut off, not UTF-8 or JSON, missing `choices`, or carrying no text (a
+refusal or a tool call instead of an answer) are reported the same way,
+never as a crash; message content given as a list of text parts is joined.
 
 ## Caching
 
@@ -213,6 +218,11 @@ form lists every suite with its cases), 2 on errors (missing prompt,
 malformed cases YAML, model unreachable or rejecting the call). A single
 version is `promptregress run --prompt sentiment --version v2`.
 
+Piping is safe: when the reader quits early (`promptregress run --all |
+head -5`) the output just stops, with no traceback, and the exit code is
+still the verdict (a failing run exits 1, never a false 0; in a shell
+pipeline `set -o pipefail` lets you see it).
+
 Ready-to-copy GitHub Actions workflow:
 [`examples/promptregress-example.yml`](examples/promptregress-example.yml).
 It runs in `--demo` mode only, so CI never depends on a live model — but
@@ -225,7 +235,8 @@ in the file).
 
 This repo's own CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml))
 installs the package and runs the test suite on Ubuntu, Windows and macOS
-with Python 3.11, 3.12 and 3.13.
+with Python 3.11, 3.12 and 3.13, plus Python 3.10 (the oldest supported)
+on Ubuntu.
 
 ## Why not Langfuse / LangSmith / Braintrust?
 
@@ -234,7 +245,8 @@ YAML and a CLI — the solo-dev "just run my 30 golden cases in CI" slot.
 
 ## Tests
 
-89/89 pass: `python3 -m unittest discover -s tests`
+111/111 pass: `python3 -m unittest discover -s tests` (on Python 3.10 one of
+them skips: it reads `pyproject.toml` with `tomllib`, new in 3.11)
 (free — tests run against a fake in-process model server, no API spend)
 
 ## License

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import json
 import os
 import sys
@@ -36,12 +37,112 @@ def _harden_streams() -> None:
     raise UnicodeEncodeError mid-report on a failing case."""
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is None or getattr(stream, "errors", None) != "strict":
+        # Both handlers raise UnicodeEncodeError on a character the code
+        # page lacks: "strict" (the default) and "surrogateescape" (what a
+        # piped stdout reports on Windows 11 / Python 3.11, with cp1252).
+        if reconfigure is None or getattr(stream, "errors", None) not in (
+                "strict", "surrogateescape"):
             continue
         try:
             reconfigure(errors="replace")
         except (OSError, ValueError):
             pass
+
+
+# Windows does not report a pipe nobody reads as BrokenPipeError: print() of
+# a small output works there (it only fills the buffer) and the flush then
+# fails with a plain OSError(EINVAL) - at interpreter exit, as "Exception
+# ignored", with exit status 120 - or, under `python -u`, out of print().
+# A module-level flag, so tests can switch the rule on (and off) anywhere.
+_IS_WINDOWS = os.name == "nt"
+
+
+def _is_closed_pipe(e: BaseException) -> bool:
+    """True when `e` means nobody is reading this pipe any more: a
+    BrokenPipeError or any OSError with errno EPIPE, and, on Windows only,
+    plain EINVAL. Anywhere else EINVAL is a real error and is not
+    swallowed."""
+    if not isinstance(e, OSError):
+        return False
+    return (isinstance(e, BrokenPipeError) or e.errno == errno.EPIPE
+            or (_IS_WINDOWS and e.errno == errno.EINVAL))
+
+
+def _discard_output(stream) -> None:
+    """Point `stream`'s file descriptor at the null device, so what is
+    still buffered (and the interpreter's own flush at exit) goes nowhere
+    instead of failing again. A stream with no descriptor needs nothing."""
+    try:
+        with open(os.devnull, "wb") as null:
+            os.dup2(null.fileno(), stream.fileno())
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+class _PipeSafe:
+    """Stand-in for sys.stdout / sys.stderr while main() runs.
+
+    The reader of a pipe can quit at any moment (`promptregress run --all
+    | head -1`). Left alone, Python raises BrokenPipeError out of print()
+    or, when the output was still buffered, prints "Exception ignored" at
+    exit and replaces the exit code with 120 (see _IS_WINDOWS for how
+    Windows words that failure). Here the first failed write or flush
+    points the stream at the null device and the command carries on into
+    it: a closed pipe acts like `> /dev/null`, the output stops and the
+    exit code is whatever the command computed.
+
+    That is the choice against the usual `except BrokenPipeError:
+    sys.exit(1)` recipe: for `run` the exit code IS the verdict (0 pass,
+    1 a case failed, 2 an error), and a shortened pipe must never turn a
+    regression into a pass, or into some other number.
+    """
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._dead = False
+
+    def _call(self, name, *args):
+        if self._dead:
+            return
+        try:
+            getattr(self._stream, name)(*args)
+        except OSError as e:
+            if not _is_closed_pipe(e):
+                raise
+            self._dead = True
+            _discard_output(self._stream)
+
+    def write(self, text):
+        self._call("write", text)
+        return len(text)
+
+    def flush(self):
+        self._call("flush")
+
+    def __getattr__(self, name):  # encoding, isatty(), reconfigure() ...
+        return getattr(self._stream, name)
+
+
+@contextlib.contextmanager
+def _closed_pipe_tolerant():
+    """Run the body with stdout and stderr wrapped in _PipeSafe."""
+    real = (sys.stdout, sys.stderr)  # either is None under pythonw
+    safe = tuple(_PipeSafe(s) if s is not None else None for s in real)
+    sys.stdout, sys.stderr = safe
+    try:
+        yield
+    finally:
+        try:
+            # Flush now, with the command done, while a closed pipe is
+            # still handled. A small output only ever sits in the buffer,
+            # so nothing has failed yet; left to the interpreter's flush
+            # at exit, the error would be "Exception ignored" and the exit
+            # code 120 instead of the command's own.
+            for s in safe:
+                if s is not None:
+                    s.flush()
+        finally:
+            sys.stdout, sys.stderr = real
 
 
 def _model_kw(args) -> dict:
@@ -371,8 +472,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     _harden_streams()
-    args = build_parser().parse_args(argv)
     with contextlib.ExitStack() as stack:
+        # `... | head -1` must neither traceback nor change the exit code.
+        stack.enter_context(_closed_pipe_tolerant())
+        args = build_parser().parse_args(argv)
         # Resources a subcommand opens (the demo's scaffold dir) are
         # released here, however the command ends.
         args.cleanup = stack

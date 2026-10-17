@@ -7,7 +7,8 @@ Handles the subset these tools need:
   - block scalars: literal "|" and folded ">", with "-" (strip) and "+"
     (keep) chomping, as a mapping value or list item
   - scalars: quoted strings (double quotes take the JSON escapes:
-    backslash-n, backslash-t, escaped quote and backslash, backslash-uXXXX),
+    backslash-n, backslash-t, escaped quote and backslash, backslash-uXXXX;
+    single quotes are literal, except that a doubled '' is one '),
     ints, floats, bools, null
   - "#" comments (outside quotes)
 
@@ -69,6 +70,9 @@ def _scalar(s: str):
                 return json.loads(s)
             except ValueError:
                 inner = inner.replace('\\"', '"').replace("\\\\", "\\")
+        else:
+            # Single quotes are literal; their only escape is '' -> '.
+            inner = inner.replace("''", "'")
         return inner
     low = s.lower()
     if low in ("null", "~", "none", ""):

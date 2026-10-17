@@ -16,6 +16,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python: ["3.11", "3.12", "3.13"]
+        include:
+          # requires-python is >=3.10: check that floor once, on the
+          # cheapest runner, instead of on all three systems.
+          - os: ubuntu-latest
+            python: "3.10"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

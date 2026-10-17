@@ -12,6 +12,7 @@ Config (env or flags):
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import urllib.request
@@ -25,6 +26,13 @@ class ModelError(RuntimeError):
     pass
 
 
+def _error_text(err) -> str:
+    """The message of an OpenAI-style error value, {"message": "..."} or a
+    bare string; "" when there is none."""
+    msg = err.get("message") if isinstance(err, dict) else err
+    return msg.strip() if isinstance(msg, str) else ""
+
+
 def _http_detail(e: urllib.error.HTTPError) -> str:
     """The server's own error text: OpenAI-style {"error": {"message"}}
     when present, else the (whitespace-collapsed) body."""
@@ -33,10 +41,9 @@ def _http_detail(e: urllib.error.HTTPError) -> str:
     except Exception:  # noqa: BLE001 - the status line is still useful
         return ""
     try:
-        err = json.loads(body).get("error")
-        msg = err.get("message") if isinstance(err, dict) else err
-        if isinstance(msg, str) and msg.strip():
-            return msg.strip()
+        msg = _error_text(json.loads(body).get("error"))
+        if msg:
+            return msg
     except (ValueError, AttributeError):
         pass
     if body.lstrip().startswith("<"):
@@ -64,11 +71,78 @@ def _fmt_seconds(t: float) -> str:
     return f"{t:g}s"
 
 
+_JSON_KINDS = {dict: "an object", list: "an array", str: "a string",
+               bool: "a boolean", int: "a number", float: "a number",
+               type(None): "null"}
+
+
+def _kind(value) -> str:
+    """Plain-English JSON type of a decoded value, for error messages."""
+    return _JSON_KINDS.get(type(value), type(value).__name__)
+
+
+def _reply_text(data, where: str) -> str:
+    """The assistant's text out of a chat-completions reply.
+
+    Anything else is a ModelError that says what came back instead: a
+    refusal or tool call (`content: null`), content with no text in it, no
+    choices, an error sent with HTTP 200, a body that is not an object.
+    Nothing but a string ever leaves here, so no later step (an assertion,
+    the judge, the cache) meets None or a list.
+    """
+    def odd(what: str) -> ModelError:
+        return ModelError(f"model at {where} sent an unexpected reply: {what}")
+
+    if not isinstance(data, dict):
+        raise odd(f"expected a JSON object, got {_kind(data)}")
+    choices = data.get("choices")
+    if not choices:
+        # some gateways send an error body with HTTP 200
+        err = _error_text(data.get("error"))
+        if err:
+            raise ModelError(
+                f"model at {where} returned an error: {err[:200]}")
+        raise odd("no choices")
+    if not isinstance(choices, list):
+        raise odd(f'"choices" is {_kind(choices)}, expected a list')
+    first = choices[0]
+    message = first.get("message") if isinstance(first, dict) else None
+    if not isinstance(message, dict):
+        raise odd("the first choice has no message")
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):  # content parts: keep the text ones
+        texts = [p["text"] for p in content
+                 if isinstance(p, dict) and isinstance(p.get("text"), str)
+                 and p.get("type", "text") in ("text", "output_text")]
+        if texts:
+            return "".join(texts)
+        raise ModelError(f"model at {where} answered without any text "
+                         f"(content has no text parts)")
+    if content is None:
+        refusal = message.get("refusal")
+        if isinstance(refusal, str) and refusal.strip():
+            why = f"; it refused: {refusal.strip()[:200]}"
+        elif message.get("tool_calls"):
+            why = "; it answered with a tool call instead"
+        else:
+            why = ""
+        state = "null" if "content" in message else "missing"
+        raise ModelError(f"model at {where} answered without any text "
+                         f"(content is {state}{why})")
+    raise odd(f"message content is {_kind(content)}, expected text")
+
+
 def complete(prompt: str, *, base_url=None, api_key=None, model=None,
              temperature: float = 0.0, timeout: float | None = None) -> str:
     """One chat completion. `timeout` (seconds, connect and read) defaults
     to PROMPTREGRESS_TIMEOUT or 60: a hung endpoint fails one request,
-    not the whole suite times 120 s."""
+    not the whole suite times 120 s.
+
+    Returns the answer text. Everything else that can come back (an HTTP
+    error, a cut-off or non-UTF-8 or non-JSON body, a reply with no text)
+    raises ModelError with a plain message."""
     cfg = _cfg(base_url, api_key, model, timeout)
     timeout = cfg["timeout"]
     body = json.dumps({
@@ -82,7 +156,7 @@ def complete(prompt: str, *, base_url=None, api_key=None, model=None,
                  "Authorization": f"Bearer {cfg['api_key']}"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode())
+            raw = resp.read()
     except urllib.error.HTTPError as e:
         # A 401 (bad key) or 404 (wrong path/model) is not "unreachable":
         # surface the status and the server's message.
@@ -99,12 +173,24 @@ def complete(prompt: str, *, base_url=None, api_key=None, model=None,
             f"model at {cfg['base_url']} timed out after "
             f"{_fmt_seconds(timeout)} (raise it with --timeout / "
             f"PROMPTREGRESS_TIMEOUT)")
-    except (json.JSONDecodeError, KeyError) as e:
-        raise ModelError(f"bad response from model: {e}")
+    except http.client.IncompleteRead as e:
+        raise ModelError(
+            f"model at {cfg['base_url']} hung up before the whole reply "
+            f"arrived (got {len(e.partial)} bytes)")
+    except (OSError, http.client.HTTPException) as e:
+        # reset mid-reply, hung up without answering, not HTTP at all ...
+        raise ModelError(
+            f"model at {cfg['base_url']} failed: "
+            f"{' '.join(str(e).split()) or type(e).__name__}")
     try:
-        return data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as e:
-        raise ModelError(f"unexpected response shape: {e}")
+        data = json.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError:  # a ValueError: must come first
+        raise ModelError(
+            f"model at {cfg['base_url']} sent a reply that is not UTF-8 text")
+    except ValueError as e:
+        raise ModelError(f"model at {cfg['base_url']} sent a reply that is "
+                         f"not valid JSON: {e}")
+    return _reply_text(data, cfg["base_url"])
 
 
 JUDGE_TEMPLATE = """You are a strict test judge. Answer with exactly one word: PASS or FAIL.

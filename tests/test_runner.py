@@ -1,16 +1,19 @@
 """Runner + CLI tests against the fake model server."""
 
+import errno
 import glob
 import io
 import json
 import os
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import warnings
 from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest import mock
@@ -929,6 +932,601 @@ class TestRound3(unittest.TestCase):
             f.write("not json")
         self.assertIsNone(runner_mod._cache_read(tmp, "k1"))
         self.assertFalse(hasattr(runner_mod, "_judge_cache_get"))
+
+
+def http_reply(body, status="200 OK", length=None):
+    """A complete HTTP/1.1 response as bytes. `length` overrides the
+    Content-Length header (to promise more body than is sent)."""
+    n = len(body) if length is None else length
+    return (f"HTTP/1.1 {status}\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {n}\r\nConnection: close\r\n\r\n"
+            ).encode() + body
+
+
+def start_raw_server(reply):
+    """Reads one request, then writes `reply` (bytes) verbatim and hangs
+    up: lets a test craft cut-off, garbled or non-UTF-8 replies exactly.
+    Returns (close, url) like start_hanging_server."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+
+    def serve():
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            with conn:
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                head, _, body = buf.partition(b"\r\n\r\n")
+                need = 0
+                for line in head.split(b"\r\n"):
+                    if line.lower().startswith(b"content-length:"):
+                        need = int(line.split(b":", 1)[1])
+                while len(body) < need:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    body += chunk
+                conn.sendall(reply)
+
+    threading.Thread(target=serve, daemon=True).start()
+    return srv.close, f"http://127.0.0.1:{srv.getsockname()[1]}/v1"
+
+
+class TestRound4(unittest.TestCase):
+    """Round-4 expert-review regressions."""
+
+    # Python's own wording must never reach the user.
+    JARGON = ("NoneType", "subscriptable", "indices", "KeyError",
+              "IndexError", "TypeError", "AttributeError", "Traceback",
+              "IncompleteRead", "codec")
+
+    def _run_capture(self, argv):
+        out_buf, err_buf = io.StringIO(), io.StringIO()
+        with redirect_stdout(out_buf), redirect_stderr(err_buf):
+            code = cli_mod.main(argv)
+        return code, out_buf.getvalue(), err_buf.getvalue()
+
+    def _model_error(self, reply):
+        """The ModelError text complete() raises for the raw HTTP `reply`."""
+        close, url = start_raw_server(reply)
+        try:
+            with self.assertRaises(model_mod.ModelError) as ctx:
+                model_mod.complete("hi", base_url=url, timeout=5)
+        finally:
+            close()
+        msg = str(ctx.exception)
+        self.assertTrue(msg.startswith("model at http://127.0.0.1:"), msg)
+        for word in self.JARGON:
+            self.assertNotIn(word, msg)
+        return msg
+
+    def test_unexpected_reply_shapes_are_model_errors(self):
+        # `"content": null` (an OpenAI refusal or tool-call reply), list /
+        # number / object content, no choices, a non-object body ... used
+        # to be returned as None / list / ... and crash later (TypeError in
+        # an assertion, AttributeError in the judge) or surface as Python's
+        # own wording ("list index out of range").
+        shapes = [
+            ('{"choices":[{"message":{"content":null}}]}',
+             "answered without any text (content is null)"),
+            ('{"choices":[{"message":{"role":"assistant","content":null,'
+             '"refusal":"I cannot help with that."}}]}',
+             "it refused: I cannot help with that."),
+            ('{"choices":[{"message":{"content":null,'
+             '"tool_calls":[{"id":"call_1"}]}}]}', "tool call"),
+            ('{"choices":[{"message":{}}]}', "(content is missing)"),
+            ('{"choices":[{"message":{"content":[]}}]}', "no text parts"),
+            ('{"choices":[{"message":{"content":[{"type":"image_url",'
+             '"image_url":{}}]}}]}', "no text parts"),
+            ('{"choices":[{"message":{"content":5}}]}',
+             "content is a number"),
+            ('{"choices":[{"message":{"content":{"a":1}}}]}',
+             "content is an object"),
+            ('{"choices":[{"message":{"content":true}}]}',
+             "content is a boolean"),
+            ('{"choices":[]}', "no choices"),
+            ('{"choices":null}', "no choices"),
+            ('{"id":"x"}', "no choices"),
+            ('{"choices":"abc"}', '"choices" is a string'),
+            ('{"choices":[1]}', "no message"),
+            ('{"choices":[{"message":"hi"}]}', "no message"),
+            ('{"choices":[{"text":"legacy completions shape"}]}',
+             "no message"),
+            ('[1,2]', "got an array"),
+            ('"hi"', "got a string"),
+            ('7', "got a number"),
+            ('null', "got null"),
+            # an error envelope sent with HTTP 200 (some gateways do)
+            ('{"error":{"message":"Provider returned error","code":502}}',
+             "returned an error: Provider returned error"),
+            ('{"error":"overloaded"}', "returned an error: overloaded"),
+        ]
+        for body, want in shapes:
+            msg = self._model_error(http_reply(body.encode()))
+            self.assertIn(want, msg, body)
+
+    def test_legitimate_reply_shapes_still_work(self):
+        ok = [
+            ('{"choices":[{"message":{"content":"hello"}}]}', "hello"),
+            # an empty answer is still an answer
+            ('{"choices":[{"message":{"content":""}}]}', ""),
+            ('{"id":"c1","choices":[{"index":0,"message":{"role":'
+             '"assistant","content":"hi","tool_calls":[{"id":"1"}],'
+             '"refusal":null},"finish_reason":"stop"}],'
+             '"usage":{"total_tokens":3}}', "hi"),
+            # content as a list of text parts: the text parts, joined
+            ('{"choices":[{"message":{"content":[{"type":"text","text":'
+             '"he"},{"type":"text","text":"llo"}]}}]}', "hello"),
+            ('{"choices":[{"message":{"content":[{"type":"image_url"},'
+             '{"type":"text","text":"x"},{"type":"refusal","refusal":'
+             '"no"}]}}]}', "x"),
+            # first choice wins
+            ('{"choices":[{"message":{"content":"first"}},'
+             '{"message":{"content":"second"}}]}', "first"),
+            ('{"choices":[{"message":{"content":"caf\\u00e9 \\u2713"}}]}',
+             "café ✓"),
+        ]
+        for body, want in ok:
+            close, url = start_raw_server(http_reply(body.encode()))
+            try:
+                self.assertEqual(model_mod.complete("hi", base_url=url,
+                                                    timeout=5), want, body)
+            finally:
+                close()
+        # raw (not escaped) UTF-8 in the body is fine too
+        close, url = start_raw_server(http_reply(
+            '{"choices":[{"message":{"content":"café"}}]}'
+            .encode("utf-8")))
+        try:
+            self.assertEqual(model_mod.complete("hi", base_url=url,
+                                                timeout=5), "café")
+        finally:
+            close()
+
+    def test_cut_off_and_garbled_replies_are_model_errors(self):
+        # IncompleteRead (body shorter than Content-Length, or a chunked
+        # body cut mid-chunk), a server that hangs up without answering,
+        # a reply that is not HTTP, and a body that is not UTF-8 all
+        # escaped complete() as raw exceptions.
+        body = b'{"choices":[{"message":{"content":"hello"}}]}'
+        cases = [
+            (http_reply(body[:12], length=len(body)),
+             "hung up before the whole reply arrived (got 12 bytes)"),
+            (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+             b"64\r\n" + body[:10],
+             "hung up before the whole reply arrived"),
+            (b"", "failed:"),
+            (b"HELLO THERE\r\n\r\n", "failed: HELLO THERE"),
+            (http_reply(b'{"choices":[{"message":{"content":"caf\xe9"}}]}'),
+             "not UTF-8 text"),
+            (http_reply('{"choices":[]}'.encode("utf-16")),
+             "not UTF-8 text"),
+            (http_reply(b"<html>login</html>"), "not valid JSON"),
+            (http_reply(b""), "not valid JSON"),
+        ]
+        for reply, want in cases:
+            self.assertIn(want, self._model_error(reply), reply[:60])
+
+    def test_unusable_replies_stop_the_cli_with_exit_2(self):
+        # Exit 2 and one plain "error:" line. A traceback exits 1, which
+        # CI reads as "a case regressed".
+        tmp = tempfile.mkdtemp()
+        make_suite(tmp)
+        replies = {
+            "null content": http_reply(
+                b'{"choices":[{"message":{"content":null}}]}'),
+            "cut off": http_reply(b'{"choices":[', length=500),
+            "not utf-8": http_reply(
+                b'{"choices":[{"message":{"content":"caf\xe9"}}]}'),
+        }
+        for label, reply in replies.items():
+            close, url = start_raw_server(reply)
+            try:
+                code, out, err = self._run_capture(
+                    ["--root", tmp, "--base-url", url, "run", "--prompt",
+                     "cls", "--version", "v1", "--no-cache"])
+            finally:
+                close()
+            self.assertEqual(code, 2, (label, err))
+            self.assertEqual(out, "", label)
+            self.assertTrue(
+                err.startswith("error: model at http://127.0.0.1:"),
+                (label, err))
+            self.assertIn("stopped at case 'neg'", err)
+            for word in self.JARGON:
+                self.assertNotIn(word, err, label)
+        close, url = start_raw_server(
+            replies["null content"])
+        try:
+            code, out, err = self._run_capture(
+                ["--root", tmp, "--base-url", url, "diff", "v1", "v2",
+                 "--prompt", "cls", "--no-cache"])
+        finally:
+            close()
+        self.assertEqual(code, 2, err)
+        self.assertIn("answered without any text", err)
+
+    def test_cases_file_single_quoted_apostrophes(self):
+        # 'don''t' in a cases file is don't, in the name, the input the
+        # model is sent and the assertion text.
+        tmp = tempfile.mkdtemp()
+        make_suite(tmp)
+        with open(os.path.join(tmp, "prompts", "cls.cases.yaml"), "w",
+                  encoding="utf-8") as f:
+            f.write("cases:\n"
+                    "  - name: 'don''t panic'\n"
+                    "    input: 'It''s fine, isn''t it?'\n"
+                    "    assert:\n"
+                    "      - contains: 'it''s'\n")
+        case = suite_mod.load_cases(tmp, "cls")[0]
+        self.assertEqual(case["name"], "don't panic")
+        self.assertEqual(case["input"], "It's fine, isn't it?")
+        self.assertEqual(case["assert"], [{"contains": "it's"}])
+        server, url = start_fake_model({"isn't it?": "yes, it's fine"})
+        try:
+            results, _ = runner_mod.run_suite(
+                tmp, "cls", "v1", use_cache=False,
+                model_kw={"base_url": url, "model": "fake"})
+        finally:
+            server.shutdown()
+        self.assertEqual([r.passed for r in results], [True])
+        self.assertEqual(results[0].output, "yes, it's fine")
+
+    def test_judge_reply_without_text_is_a_judge_outage_not_a_crash(self):
+        # A judge model answering `content: null` crashed run_case with
+        # AttributeError (None.strip()); like any judge outage it is now a
+        # failed assertion with the reason, and is never cached.
+        tmp = tempfile.mkdtemp()
+        make_judge_suite(tmp)
+        gen, gen_url = start_fake_model({})
+        close, judge_url = start_raw_server(http_reply(
+            b'{"choices":[{"message":{"content":null}}]}'))
+        try:
+            prompt = suite_mod.load_prompt(tmp, "cls", "v1")
+            case = suite_mod.load_cases(tmp, "cls")[0]
+            r = runner_mod.run_case(
+                tmp, "cls", "v1", prompt, case,
+                {"base_url": gen_url, "model": "fake"},
+                judge_model_kw={"base_url": judge_url, "model": "fake"})
+        finally:
+            close()
+            gen.shutdown()
+        self.assertFalse(r.passed)
+        self.assertIn("judge unavailable", r.assertions[0].detail)
+        self.assertIn("answered without any text", r.assertions[0].detail)
+        cached = os.listdir(os.path.join(tmp, ".promptregress", "cache"))
+        self.assertEqual([f for f in cached if f.startswith("judge-")], [])
+
+
+class ClosedPipe(io.StringIO):
+    """A stdout whose reader has gone away. `fails` is the call that
+    raises: "write" (unbuffered / write-through streams fail inside
+    print()) or "flush" (buffered streams fail when flushed). `fd`, when
+    given, is the descriptor the stream reports, so a test can look at
+    where it points afterwards."""
+
+    def __init__(self, fails="write", error=None, fd=None):
+        super().__init__()
+        self.fails = fails
+        self.error = error or BrokenPipeError(errno.EPIPE, "Broken pipe")
+        self.fd = fd
+
+    def fileno(self):
+        return super().fileno() if self.fd is None else self.fd
+
+    def write(self, text):
+        if self.fails == "write":
+            raise self.error
+        return super().write(text)
+
+    def flush(self):
+        raise self.error
+
+
+# Run by TestClosedPipe in a child process. fd 1 is rebuilt the way Windows
+# has it when nobody reads the pipe: the failing write is a plain
+# OSError(EINVAL), not a BrokenPipeError. sys.stdout sits on top of it the
+# way Python builds it ("buffered", or write-through like `python -u`), so
+# the interpreter's own flush at exit meets the same failing write.
+WINDOWS_CHILD = """
+import errno, io, os, sys
+from promptregress import cli
+
+
+class WinPipe(io.RawIOBase):
+    def writable(self):
+        return True
+
+    def fileno(self):
+        return 1
+
+    def write(self, data):
+        try:
+            return os.write(1, data)
+        except BrokenPipeError:
+            raise OSError(errno.EINVAL, 'Invalid argument') from None
+
+
+cli._IS_WINDOWS = True
+if sys.argv[1] == 'buffered':
+    sys.stdout = io.TextIOWrapper(io.BufferedWriter(WinPipe()), 'utf-8')
+else:
+    sys.stdout = io.TextIOWrapper(WinPipe(), 'utf-8', write_through=True)
+code = cli.main(sys.argv[2:])
+try:
+    os.write(1, b'x')
+    print('fd1 redirected: yes', file=sys.stderr)
+except OSError:
+    print('fd1 redirected: no', file=sys.stderr)
+sys.exit(code)
+"""
+
+
+class TestClosedPipe(unittest.TestCase):
+    """`promptregress ... | head -1`: the reader quits while we still
+    write. No traceback, no "Exception ignored" noise, and the exit code
+    stays the command's own (for `run` it is the verdict)."""
+
+    REPO = os.path.dirname(os.path.dirname(os.path.abspath(cli_mod.__file__)))
+
+    def _into_closed_pipe(self, argv, unbuffered, both=False):
+        """Run the CLI with stdout (and stderr when `both`) wired to a pipe
+        whose reader is already gone. Returns (exit code, stderr text)."""
+        env = {**os.environ}
+        env.pop("PROMPTREGRESS_BASE_URL", None)
+        env.pop("PYTHONUNBUFFERED", None)
+        if unbuffered:  # write-through: the error is raised inside print()
+            env["PYTHONUNBUFFERED"] = "1"
+        r, w = os.pipe()
+        os.close(r)
+        try:
+            p = subprocess.run(
+                [sys.executable, "-m", "promptregress", *argv], stdout=w,
+                stderr=w if both else subprocess.PIPE, cwd=self.REPO,
+                env=env, timeout=120)
+        finally:
+            os.close(w)
+        return p.returncode, (p.stderr or b"").decode("utf-8", "replace")
+
+    def _assert_quiet(self, err, label):
+        for noise in ("Traceback", "BrokenPipeError", "Exception ignored",
+                      "Errno"):
+            self.assertNotIn(noise, err, label)
+
+    def test_closed_stdout_pipe_exits_quietly_with_the_commands_own_code(self):
+        tmp = tempfile.mkdtemp()
+        # (argv, the exit code the command computes) - never a false pass
+        # for the failing run, never Python's 120 / 1 for the rest
+        buffered = [
+            (["--demo", "run", "--prompt", "sentiment", "--version", "v2"], 1),
+            (["--demo", "run", "--prompt", "sentiment", "--version", "v1"], 0),
+            (["--demo", "run", "--all", "--format", "json"], 1),
+            (["--demo", "diff", "v1", "v2", "--prompt", "sentiment"], 0),
+            (["list"], 0),
+            (["--version"], 0),
+            (["-h"], 0),
+        ]
+        unbuffered = buffered[:1] + buffered[4:5]
+        for mode, cases in ((False, buffered), (True, unbuffered)):
+            for argv, want in cases:
+                code, err = self._into_closed_pipe(
+                    ["--root", tmp, *argv], unbuffered=mode)
+                label = (argv, "unbuffered" if mode else "buffered")
+                self.assertEqual(code, want, (label, err))
+                self._assert_quiet(err, label)
+
+    def test_closed_pipe_on_both_streams_keeps_the_error_code(self):
+        # `promptregress ... 2>&1 | head`: even the error line has nowhere
+        # to go, and exit code 2 (model unusable) must survive
+        tmp = tempfile.mkdtemp()
+        make_suite(tmp)
+        for unbuffered in (False, True):
+            code, _ = self._into_closed_pipe(
+                ["--root", tmp, "--base-url", "http://127.0.0.1:1/v1", "run",
+                 "--prompt", "cls", "--version", "v1", "--no-cache"],
+                unbuffered=unbuffered, both=True)
+            self.assertEqual(code, 2, unbuffered)
+
+    def test_in_process_closed_stdout_keeps_the_verdict(self):
+        tmp = tempfile.mkdtemp()
+        make_suite(tmp)
+        server, url = start_fake_model({"terrible": "negative",
+                                        "great": "positive"})
+        server2, url2 = start_fake_model({})  # answers "ok": cases fail
+        argv = ["--root", tmp, "run", "--prompt", "cls", "--version", "v1",
+                "--no-cache", "--base-url"]
+        try:
+            for fails in ("write", "flush"):
+                for base, want in ((url, 0), (url2, 1)):
+                    code, err = self._run_main([*argv, base],
+                                               ClosedPipe(fails))
+                    self.assertEqual(code, want, (fails, base))
+                    self.assertEqual(err, "", (fails, base))
+        finally:
+            server.shutdown()
+            server2.shutdown()
+        # help / version exit through SystemExit(0), not an error
+        for flag in ("-h", "--version"):
+            with redirect_stdout(ClosedPipe("write")):
+                with self.assertRaises(SystemExit) as ctx:
+                    cli_mod.main([flag])
+            self.assertEqual(ctx.exception.code, 0)
+
+    def test_stdout_is_restored_and_other_write_errors_still_raise(self):
+        # only a closed pipe is tolerated: a full disk is still an error
+        out = ClosedPipe("write", OSError(errno.ENOSPC, "No space left"))
+        with redirect_stdout(out):
+            with self.assertRaises(OSError) as ctx:
+                cli_mod.main(["--root", tempfile.mkdtemp(), "list"])
+        self.assertEqual(ctx.exception.errno, errno.ENOSPC)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cli_mod.main(["--root", tempfile.mkdtemp(), "list"])
+            self.assertIs(sys.stdout, buf)  # main() put the stream back
+        self.assertIn("no prompts found", buf.getvalue())
+
+    def test_closed_pipe_errno_by_platform(self):
+        gone = cli_mod._is_closed_pipe
+
+        class KeepsErrno(OSError):  # OSError(EPIPE, ...) itself comes back
+            pass                    # as a BrokenPipeError; this does not
+
+        pipe = (errno.EPIPE, "Broken pipe")
+        invalid = OSError(errno.EINVAL, "Invalid argument")
+        self.assertEqual(cli_mod._IS_WINDOWS, os.name == "nt")
+        for windows in (False, True):
+            with mock.patch.object(cli_mod, "_IS_WINDOWS", windows):
+                self.assertTrue(gone(BrokenPipeError(*pipe)))
+                self.assertTrue(gone(BrokenPipeError()))
+                self.assertTrue(gone(KeepsErrno(*pipe)))
+                self.assertFalse(gone(OSError(errno.ENOSPC, "No space left")))
+                self.assertFalse(gone(ValueError("closed file")))
+        # Windows reports a closed pipe as plain EINVAL; elsewhere EINVAL is
+        # just an error
+        with mock.patch.object(cli_mod, "_IS_WINDOWS", True):
+            self.assertTrue(gone(invalid))
+        with mock.patch.object(cli_mod, "_IS_WINDOWS", False):
+            self.assertFalse(gone(invalid))
+
+    # Windows: a pipe nobody reads is not an EPIPE. print() of a small
+    # output works there (it only fills the buffer) and the flush then fails
+    # with a plain OSError(EINVAL) - at interpreter exit as "Exception
+    # ignored" with exit status 120, or under `python -u` out of print()
+    # itself. The tests below reproduce that on any platform: the Windows
+    # flag is switched on and main() gets a stdout that fails that way. The
+    # real closed-pipe tests above are the proof on a real Windows.
+
+    def _points_at_null_device(self, fd):
+        """A closed pipe is a FIFO and refuses writes; the null device is a
+        character device and takes them."""
+        if not stat.S_ISCHR(os.fstat(fd).st_mode):
+            return False
+        try:
+            os.write(fd, b"x")
+        except OSError:
+            return False
+        return True
+
+    def _dead_pipe_fd(self):
+        """What fd 1 is in `cmd | head -1` once head has quit."""
+        r, w = os.pipe()
+        os.close(r)
+        self.addCleanup(os.close, w)
+        self.assertFalse(self._points_at_null_device(w))
+        return w
+
+    def _run_main(self, argv, stdout):
+        """cli.main() with `stdout` in place: (exit code, stderr text). A
+        SystemExit (-h, --version) counts as its code; anything else that
+        escapes is a test error."""
+        err = io.StringIO()
+        with warnings.catch_warnings():
+            # the garbage collector may report another test's unclosed
+            # socket right here, into the redirected stderr
+            warnings.simplefilter("ignore", ResourceWarning)
+            with redirect_stdout(stdout), redirect_stderr(err):
+                try:
+                    code = cli_mod.main(argv)
+                except SystemExit as e:
+                    code = e.code
+        return code, err.getvalue()
+
+    def test_windows_closed_pipe_keeps_the_verdict(self):
+        tmp = tempfile.mkdtemp()
+        make_suite(tmp)
+        server, url = start_fake_model({"terrible": "negative",
+                                        "great": "positive"})
+        server2, url2 = start_fake_model({})  # answers "ok": cases fail
+        argv = ["--root", tmp, "run", "--prompt", "cls", "--version", "v1",
+                "--no-cache", "--base-url"]
+        try:
+            for fails in ("flush", "write"):
+                for base, want in ((url, 0), (url2, 1)):
+                    fd = self._dead_pipe_fd()
+                    out = ClosedPipe(
+                        fails, OSError(errno.EINVAL, "Invalid argument"), fd)
+                    with mock.patch.object(cli_mod, "_IS_WINDOWS", True):
+                        code, err = self._run_main([*argv, base], out)
+                    label = (fails, want)
+                    self.assertEqual(code, want, label)  # never a false 0
+                    self.assertEqual(err, "", label)
+                    self.assertTrue(self._points_at_null_device(fd), label)
+        finally:
+            server.shutdown()
+            server2.shutdown()
+
+    def test_windows_closed_pipe_with_one_line_of_output(self):
+        # `list` prints a single line: only the final flush can notice that
+        # the pipe is gone, and it has to happen inside main(), not at exit
+        for argv in (["list"], ["-h"], ["--version"]):
+            for fails in ("flush", "write"):
+                fd = self._dead_pipe_fd()
+                out = ClosedPipe(
+                    fails, OSError(errno.EINVAL, "Invalid argument"), fd)
+                with mock.patch.object(cli_mod, "_IS_WINDOWS", True):
+                    code, err = self._run_main(
+                        ["--root", tempfile.mkdtemp(), *argv], out)
+                label = (argv, fails)
+                self.assertEqual(code, 0, label)
+                self.assertEqual(err, "", label)
+                self.assertTrue(self._points_at_null_device(fd), label)
+
+    def test_einval_is_only_a_closed_pipe_on_windows(self):
+        invalid = (errno.EINVAL, "Invalid argument")
+        full = (errno.ENOSPC, "No space left on device")
+        # (Windows?, error): none of these is a closed pipe, so none of
+        # them may be swallowed
+        for windows, error in ((False, invalid), (True, full),
+                               (False, full)):
+            for fails in ("flush", "write"):
+                fd = self._dead_pipe_fd()
+                out = ClosedPipe(fails, OSError(*error), fd)
+                with mock.patch.object(cli_mod, "_IS_WINDOWS", windows):
+                    with redirect_stdout(out):
+                        with self.assertRaises(OSError) as ctx:
+                            cli_mod.main(
+                                ["--root", tempfile.mkdtemp(), "list"])
+                label = (windows, error[0], fails)
+                self.assertEqual(ctx.exception.errno, error[0], label)
+                self.assertFalse(self._points_at_null_device(fd), label)
+
+    def test_windows_exit_flush_is_clean(self):
+        # The symptom itself, end to end: stdout rebuilt on a raw stream
+        # whose failing write is OSError(EINVAL), so the interpreter's own
+        # flush at exit would print "Exception ignored" and exit 120.
+        tmp = tempfile.mkdtemp()
+        env = {**os.environ}
+        env.pop("PROMPTREGRESS_BASE_URL", None)
+        cases = [
+            (["--demo", "run", "--prompt", "sentiment", "--version", "v2"], 1),
+            (["--demo", "run", "--prompt", "sentiment", "--version", "v1"], 0),
+            (["list"], 0),
+        ]
+        for mode in ("buffered", "write-through"):
+            for argv, want in cases:
+                r, w = os.pipe()
+                os.close(r)
+                try:
+                    p = subprocess.run(
+                        [sys.executable, "-c", WINDOWS_CHILD, mode,
+                         "--root", tmp, *argv],
+                        stdout=w, stderr=subprocess.PIPE, cwd=self.REPO,
+                        env=env, timeout=120)
+                finally:
+                    os.close(w)
+                err = p.stderr.decode("utf-8", "replace")
+                label = (mode, argv, err)
+                self.assertEqual(p.returncode, want, label)
+                self._assert_quiet(err, label)
+                self.assertIn("fd1 redirected: yes", err, label)
 
 
 if __name__ == "__main__":
