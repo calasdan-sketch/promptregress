@@ -5,6 +5,7 @@ diff versions A/B, and catch prompt drift before your users do.
 
   python3 -m promptregress init
   python3 -m promptregress --demo run --prompt sentiment --version v1
+  python3 -m promptregress run --all            # every prompt x every version
   python3 -m promptregress diff v1 v2 --prompt sentiment
   python3 -m promptregress list
 
@@ -22,20 +23,33 @@ import sys
 import tempfile
 
 from . import demo as demo_mod
+from . import model as model_mod
 from . import runner as runner_mod
 from . import suite as suite_mod
 
 VERSION = "0.1.0"
 
 
+def _harden_streams() -> None:
+    """Never traceback on a console that cannot encode the report
+    (Windows cp1252 pipes, LANG=C): the ✗ and ← marks would otherwise
+    raise UnicodeEncodeError mid-report on a failing case."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None or getattr(stream, "errors", None) != "strict":
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (OSError, ValueError):
+            pass
+
+
 def _model_kw(args) -> dict:
     kw: dict = {}
-    if args.model:
-        kw["model"] = args.model
-    if args.base_url:
-        kw["base_url"] = args.base_url
-    if args.api_key:
-        kw["api_key"] = args.api_key
+    for name in ("model", "base_url", "api_key", "timeout"):
+        val = getattr(args, name, None)
+        if val is not None:
+            kw[name] = val
     return kw
 
 
@@ -78,7 +92,7 @@ def scaffold_example(root: str) -> list[str]:
                         ("sentiment.cases.yaml", INIT_CASES)]:
         p = os.path.join(d, fn)
         if not os.path.exists(p):
-            with open(p, "w") as f:
+            with open(p, "w", encoding="utf-8") as f:
                 f.write(content)
             written.append(fn)
     return written
@@ -100,11 +114,15 @@ def cmd_init(args) -> int:
 
 def _demo_root(args) -> str:
     """Root for a --demo run. Uses the real prompts/ when the requested
-    prompt+version exists there; otherwise scaffolds the example into a
-    temp dir (removed when the command ends) so the trial works with
-    zero setup."""
-    have = suite_mod.list_prompts(args.root).get(args.prompt, [])
-    if args.cmd == "run" and args.version in have:
+    prompt+version exists there (for `run --all`: when any prompt does);
+    otherwise scaffolds the example into a temp dir (removed when the
+    command ends) so the trial works with zero setup."""
+    prompts = suite_mod.list_prompts(args.root)
+    if args.cmd == "run" and getattr(args, "all", False) and prompts:
+        return args.root
+    have = prompts.get(getattr(args, "prompt", None) or "", [])
+    if args.cmd == "run" and not getattr(args, "all", False) \
+            and args.version in have:
         return args.root
     if args.cmd == "diff" and args.v1 in have and args.v2 in have:
         return args.root
@@ -132,17 +150,20 @@ def cmd_list(args) -> int:
     return 0
 
 
+def _suite_dict(name: str, version: str,
+                results: list[runner_mod.CaseResult]) -> dict:
+    return {
+        "prompt": name, "version": version,
+        "passed": sum(1 for r in results if r.passed),
+        "failed": sum(1 for r in results if not r.passed),
+        "cases": [r.as_dict() for r in results],
+    }
+
+
 def _print_run(name: str, version: str,
-               results: list[runner_mod.CaseResult], fmt: str) -> int:
-    if fmt == "json":
-        print(json.dumps({
-            "prompt": name, "version": version,
-            "passed": sum(1 for r in results if r.passed),
-            "failed": sum(1 for r in results if not r.passed),
-            "cases": [r.as_dict() for r in results],
-        }, indent=2))
-        return 0 if all(r.passed for r in results) else 1
-    # pytest-style dots
+               results: list[runner_mod.CaseResult]) -> int:
+    """Human report for one prompt version: pytest-style dots, then the
+    failing cases. Returns the exit code (1 when a case failed)."""
     line = "".join("." if r.passed else "F" for r in results)
     print(f"{name}.{version}: {line}")
     failed = [r for r in results if not r.passed]
@@ -170,71 +191,111 @@ def _use_cache(args) -> bool:
 
 def _first_error(*result_lists) -> str:
     """The first model error of a run (unreachable, HTTP 401/404, timeout
-    ...), or "" when every case got an answer."""
+    ...), or "" when every case got an answer. The runner stops at that
+    case, so the message also says how many cases were left unrun."""
     for results in result_lists:
-        for r in results:
+        for i, r in enumerate(results):
             if r.error and not r.cached:
-                return r.error
+                return (f"{r.error} (stopped at case {r.name!r}; "
+                        f"no further case was run)")
     return ""
 
 
-def cmd_run(args) -> int:
-    root = _demo_root(args) if args.demo else args.root
+def _run_or_error(root, name, version, args):
+    """run_suite with the user-facing error contract: returns
+    (results, None) or (None, exit code) after printing the error."""
     try:
         results, _ = runner_mod.run_suite(
-            root, args.prompt, args.version,
-            model_kw=_model_kw(args), use_cache=_use_cache(args))
+            root, name, version, model_kw=_model_kw(args),
+            use_cache=_use_cache(args))
     except (FileNotFoundError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
-        return 2
+        return None, 2
     err = _first_error(results)
     if err:
         # model down / rejected the call — report the real reason, don't
         # pretend with an all-FAIL run
         print(f"error: {err}", file=sys.stderr)
+        return None, 2
+    return results, None
+
+
+def cmd_run(args) -> int:
+    if not args.all and not (args.prompt and args.version):
+        print("error: run needs --prompt NAME --version vN, or --all",
+              file=sys.stderr)
         return 2
-    return _print_run(args.prompt, args.version, results, args.format)
+    root = _demo_root(args) if args.demo else args.root
+    if args.all:
+        targets = [(name, v) for name, versions in
+                   suite_mod.list_prompts(root).items() for v in versions]
+        if not targets:
+            print(f"error: no prompts found under {root} — run "
+                  f"`promptregress init`", file=sys.stderr)
+            return 2
+    else:
+        targets = [(args.prompt, args.version)]
+    suites = []
+    for name, version in targets:
+        results, rc = _run_or_error(root, name, version, args)
+        if results is None:
+            return rc
+        suites.append((name, version, results))
+    if args.format == "json":
+        if not args.all:
+            name, version, results = suites[0]
+            print(json.dumps(_suite_dict(name, version, results), indent=2))
+            return 0 if all(r.passed for r in results) else 1
+        print(json.dumps({
+            "suites": [_suite_dict(n, v, r) for n, v, r in suites],
+            "passed": sum(1 for _, _, r in suites for x in r if x.passed),
+            "failed": sum(1 for _, _, r in suites for x in r if not x.passed),
+        }, indent=2))
+        return 0 if all(x.passed for _, _, r in suites for x in r) else 1
+    if not args.all:
+        return _print_run(*suites[0])
+    rc = 0
+    for name, version, results in suites:
+        rc = max(rc, _print_run(name, version, results))
+        print()
+    # summary table: one row per prompt version, failures marked
+    w = max(len(f"{n}.{v}") for n, v, _ in suites)
+    print(f"{'suite':<{w}}  passed")
+    for name, version, results in suites:
+        n_pass = sum(1 for r in results if r.passed)
+        mark = "" if n_pass == len(results) else "  FAIL"
+        print(f"{name}.{version:<{w - len(name) - 1}}  "
+              f"{n_pass}/{len(results)}{mark}")
+    total = sum(len(r) for _, _, r in suites)
+    passed = sum(1 for _, _, r in suites for x in r if x.passed)
+    bad = sum(1 for _, _, r in suites if any(not x.passed for x in r))
+    print(f"\n{len(suites)} suite(s), {bad} with failures; "
+          f"{passed}/{total} cases passed")
+    return rc
 
 
 def cmd_diff(args) -> int:
     root = _demo_root(args) if args.demo else args.root
-    kw = _model_kw(args)
-    try:
-        r1, _ = runner_mod.run_suite(root, args.prompt, args.v1,
-                                     model_kw=kw,
-                                     use_cache=_use_cache(args))
-        r2, _ = runner_mod.run_suite(root, args.prompt, args.v2,
-                                     model_kw=kw,
-                                     use_cache=_use_cache(args))
-    except (FileNotFoundError, ValueError) as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 2
-    err = _first_error(r1, r2)
-    if err:
-        # model down / rejected the call — report the real reason, don't
-        # pretend with an all-FAIL table
-        print(f"error: {err}", file=sys.stderr)
-        return 2
+    r1, rc = _run_or_error(root, args.prompt, args.v1, args)
+    if r1 is None:
+        return rc
+    r2, rc = _run_or_error(root, args.prompt, args.v2, args)
+    if r2 is None:
+        return rc
     rows = []
     for a, b in zip(r1, r2):
-        changed = a.passed != b.passed
         rows.append({
             "name": a.name,
             "v1": "pass" if a.passed else "FAIL",
             "v2": "pass" if b.passed else "FAIL",
-            "changed": changed,
+            "changed": a.passed != b.passed,
             # before/after output text on flips (truncated like run's)
             "v1_output": a.output[:300],
             "v2_output": b.output[:300],
         })
     if args.format == "json":
-        print(json.dumps({
-            "prompt": args.prompt, "v1": args.v1, "v2": args.v2,
-            "cases": [{"name": r["name"], "v1": r["v1"], "v2": r["v2"],
-                       "changed": r["changed"],
-                       "v1_output": r["v1_output"],
-                       "v2_output": r["v2_output"]} for r in rows],
-        }, indent=2))
+        print(json.dumps({"prompt": args.prompt, "v1": args.v1,
+                          "v2": args.v2, "cases": rows}, indent=2))
         return 0
     w = max([len(r["name"]) for r in rows] + [4])
     print(f"{'case':<{w}}  {args.v1:>6}  {args.v2:>6}")
@@ -251,28 +312,52 @@ def cmd_diff(args) -> int:
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="promptregress", description=__doc__)
-    p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
-    p.add_argument("--root", default=os.getcwd())
-    p.add_argument("--model", default=None)
-    p.add_argument("--base-url", default=None)
-    p.add_argument("--api-key", default=None)
+def _add_model_options(p: argparse.ArgumentParser, *, on_subcommand: bool) -> None:
+    """--model/--base-url/--api-key/--timeout/--demo, accepted both before
+    and after the subcommand. On the subcommand the defaults are
+    SUPPRESS, so an unset option there keeps the value parsed from the
+    top level instead of clobbering it with None/False."""
+    d = argparse.SUPPRESS if on_subcommand else None
+    p.add_argument("--model", default=d, help="Model name (env PROMPTREGRESS_MODEL).")
+    p.add_argument("--base-url", default=d,
+                   help="OpenAI-compatible endpoint (env PROMPTREGRESS_BASE_URL).")
+    p.add_argument("--api-key", default=d,
+                   help="API key (env PROMPTREGRESS_API_KEY is safer: a key "
+                        "on the command line is visible to other users "
+                        "via `ps` and shell history).")
+    p.add_argument("--timeout", type=float, default=d,
+                   help=f"Seconds per model request (default "
+                        f"{model_mod.DEFAULT_TIMEOUT:g}; env PROMPTREGRESS_TIMEOUT). "
+                        f"The first case the model cannot answer stops the run.")
     p.add_argument("--demo", action="store_true",
+                   default=argparse.SUPPRESS if on_subcommand else False,
                    help="Trial mode: run against the built-in in-process "
                         "fake model instead of a real endpoint. "
                         "Scaffolds the example prompts if the requested "
                         "prompt is missing.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="promptregress", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    p.add_argument("--root", default=os.getcwd())
+    _add_model_options(p, on_subcommand=False)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("init", help="Scaffold prompts/ with an example.")
     sub.add_parser("list", help="List prompts, versions, case counts.")
 
-    r = sub.add_parser("run", help="Run golden cases against a version.")
-    r.add_argument("--prompt", required=True)
-    r.add_argument("--version", required=True)
+    r = sub.add_parser("run", help="Run golden cases against a version "
+                                   "(or --all: every prompt x every version).")
+    r.add_argument("--prompt")
+    r.add_argument("--version")
+    r.add_argument("--all", action="store_true",
+                   help="Run every prompt against each of its versions and "
+                        "print a summary table; exit 1 if any case fails.")
     r.add_argument("--no-cache", action="store_true")
     r.add_argument("--format", choices=["human", "json"], default="human")
+    _add_model_options(r, on_subcommand=True)
 
     d = sub.add_parser("diff", help="A/B two versions on the same cases.")
     d.add_argument("v1")
@@ -280,10 +365,12 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--prompt", required=True)
     d.add_argument("--no-cache", action="store_true")
     d.add_argument("--format", choices=["human", "json"], default="human")
+    _add_model_options(d, on_subcommand=True)
     return p
 
 
 def main(argv=None) -> int:
+    _harden_streams()
     args = build_parser().parse_args(argv)
     with contextlib.ExitStack() as stack:
         # Resources a subcommand opens (the demo's scaffold dir) are

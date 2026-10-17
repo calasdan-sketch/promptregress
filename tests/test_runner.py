@@ -4,8 +4,12 @@ import glob
 import io
 import json
 import os
+import socket
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -425,12 +429,28 @@ class TestCLI(unittest.TestCase):
         self.assertNotIn("unreachable", out)
 
     def test_demo_diff(self):
+        # The demo's v2 chats on the neutral review (the README headline):
+        # one verdict flips, with before/after outputs shown.
         tmp = tempfile.mkdtemp()
         os.environ.pop("PROMPTREGRESS_BASE_URL", None)
         code, out = self._run(tmp, "--demo", "diff", "v1", "v2",
                               "--prompt", "sentiment")
         self.assertEqual(code, 0)
-        self.assertIn("0/3 case(s) changed", out)
+        self.assertIn("1/3 case(s) changed", out)
+        self.assertIn("neutral review    pass    FAIL  ← CHANGED", out)
+        self.assertIn("v1 output: 'neutral'", out)
+        self.assertIn(demo_mod.CHATTY_NEUTRAL, out)
+        # and `run` on v2 fails that case for the documented reason
+        code, out = self._run(tmp, "--demo", "run", "--prompt", "sentiment",
+                              "--version", "v2")
+        self.assertEqual(code, 1)
+        self.assertIn("sentiment.v2: ..F", out)
+        self.assertIn("{'max_tokens': 10} -> ~26 tokens (max 10)", out)
+        self.assertIn("2/3 passed", out)
+        code, out = self._run(tmp, "--demo", "run", "--prompt", "sentiment",
+                              "--version", "v1")
+        self.assertEqual(code, 0)
+        self.assertIn("3/3 passed", out)
 
     def test_demo_run_never_feeds_real_run_cache(self):
         # HIGH regression: --demo wrote fake-model answers into the real
@@ -624,6 +644,291 @@ class TestCLI(unittest.TestCase):
             server.shutdown()
         self.assertTrue(os.path.isfile(
             os.path.join(tmp2, ".promptregress", ".gitignore")))
+
+
+def start_hanging_server():
+    """Accepts connections and never answers (a stuck model endpoint)."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    conns = []
+
+    def accept():
+        while True:
+            try:
+                c, _ = srv.accept()
+            except OSError:
+                return
+            conns.append(c)
+
+    threading.Thread(target=accept, daemon=True).start()
+
+    def close():
+        srv.close()
+        for c in conns:
+            c.close()
+    return close, f"http://127.0.0.1:{srv.getsockname()[1]}/v1"
+
+
+class TestRound3(unittest.TestCase):
+    """Round-3 release-panel regressions."""
+
+    def _run_capture(self, argv):
+        out_buf, err_buf = io.StringIO(), io.StringIO()
+        with redirect_stdout(out_buf), redirect_stderr(err_buf):
+            code = cli_mod.main(argv)
+        return code, out_buf.getvalue(), err_buf.getvalue()
+
+    def test_cp1252_console_does_not_traceback(self):
+        # A FAIL row prints ✗ and a CHANGED row prints ←: with a cp1252
+        # (Windows pipe) stdout both died with UnicodeEncodeError.
+        tmp = tempfile.mkdtemp()
+        env = {**os.environ, "PYTHONIOENCODING": "cp1252:strict"}
+        env.pop("PYTHONUTF8", None)
+        env.pop("PROMPTREGRESS_BASE_URL", None)
+        repo_root = os.path.dirname(os.path.dirname(
+            os.path.abspath(cli_mod.__file__)))
+
+        def run(*argv):
+            return subprocess.run(
+                [sys.executable, "-m", "promptregress", "--root", tmp, *argv],
+                capture_output=True, cwd=repo_root, env=env, timeout=120)
+
+        p = run("--demo", "run", "--prompt", "sentiment", "--version", "v2")
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertNotIn(b"Traceback", p.stderr)
+        self.assertIn(b"FAIL neutral review", p.stdout)
+        self.assertIn(b"? {'max_tokens': 10}", p.stdout)  # replaced mark
+        self.assertIn(b"2/3 passed", p.stdout)
+        p = run("--demo", "diff", "v1", "v2", "--prompt", "sentiment")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn(b"Traceback", p.stderr)
+        self.assertIn(b"? CHANGED", p.stdout)
+        self.assertIn(b"1/3 case(s) changed", p.stdout)
+
+    def test_raw_yaml_scalars_in_assertions_are_bad_assertions(self):
+        # `contains: yes` (a YAML bool), `contains: ~` (null) and
+        # `max_tokens: "10"` raised TypeError out of the evaluator;
+        # `regex: (` raised re.error. All must be reported per case.
+        tmp = tempfile.mkdtemp()
+        d = os.path.join(tmp, "prompts")
+        os.makedirs(d)
+        with open(os.path.join(d, "yn.v1.txt"), "w") as f:
+            f.write("Answer: {{input}}")
+        with open(os.path.join(d, "yn.cases.yaml"), "w") as f:
+            f.write("""cases:
+  - name: bool
+    input: "a"
+    assert:
+      - contains: yes
+  - name: int
+    input: "b"
+    assert:
+      - contains: 1
+  - name: null
+    input: "c"
+    assert:
+      - contains: ~
+  - name: quoted-count
+    input: "d"
+    assert:
+      - max_tokens: "10"
+  - name: bad-regex
+    input: "e"
+    assert:
+      - regex: (
+""")
+        server, url = start_fake_model({}, default="1 yes")
+        try:
+            code, out, err = self._run_capture(
+                ["--root", tmp, "--base-url", url, "run", "--prompt", "yn",
+                 "--version", "v1", "--no-cache"])
+        finally:
+            server.shutdown()
+        self.assertEqual(code, 1)
+        self.assertNotIn("Traceback", err)
+        self.assertIn("yn.v1: F.F.F", out)
+        self.assertIn("bad assertion: contains: True is a YAML boolean", out)
+        self.assertIn('quote the text you mean, e.g. contains: "yes"', out)
+        self.assertIn("bad assertion: contains: needs text, got null", out)
+        self.assertIn("bad assertion: regex: invalid regex /(/", out)
+        self.assertIn("2/5 passed", out)  # int coerced, "10" coerced
+
+    def test_model_flags_accepted_after_the_subcommand(self):
+        # --model/--base-url/--api-key/--demo were top-level only:
+        # `run --prompt x --version v1 --base-url …` was "unrecognized
+        # arguments". Both positions must work and mean the same.
+        tmp = tempfile.mkdtemp()
+        make_suite(tmp)
+        server, url = start_fake_model({"terrible": "negative",
+                                        "great": "positive"})
+        try:
+            for argv in (["--root", tmp, "--base-url", url, "--model", "m1",
+                          "run", "--prompt", "cls", "--version", "v1",
+                          "--no-cache"],
+                         ["--root", tmp, "run", "--prompt", "cls",
+                          "--version", "v1", "--no-cache", "--base-url", url,
+                          "--model", "m1", "--api-key", "k", "--timeout", "5"],
+                         ["--root", tmp, "diff", "v1", "v2", "--prompt", "cls",
+                          "--no-cache", "--base-url", url]):
+                code, out, err = self._run_capture(argv)
+                self.assertEqual(code, 0, (argv, err))
+                self.assertIn("passed" if "run" in argv else "case(s) changed",
+                              out)
+        finally:
+            server.shutdown()
+        # a top-level value survives an unset subcommand copy
+        args = cli_mod.build_parser().parse_args(
+            ["--base-url", "http://x/v1", "--demo", "run", "--prompt", "a",
+             "--version", "v1"])
+        self.assertEqual(args.base_url, "http://x/v1")
+        self.assertTrue(args.demo)
+        self.assertIsNone(args.timeout)
+        args = cli_mod.build_parser().parse_args(
+            ["run", "--prompt", "a", "--version", "v1", "--demo",
+             "--timeout", "2.5"])
+        self.assertTrue(args.demo)
+        self.assertEqual(args.timeout, 2.5)
+        # --demo after the subcommand really uses the fake model
+        os.environ.pop("PROMPTREGRESS_BASE_URL", None)
+        code, out, err = self._run_capture(
+            ["--root", tempfile.mkdtemp(), "run", "--prompt", "sentiment",
+             "--version", "v1", "--demo"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("3/3 passed", out)
+
+    def test_timeout_flag_and_fail_fast_on_hung_endpoint(self):
+        # No --timeout and no fail-fast: a hung endpoint cost
+        # cases x 120 s. Now the first unanswered case ends the run.
+        tmp = tempfile.mkdtemp()
+        make_suite(tmp)  # 2 cases
+        close, url = start_hanging_server()
+        try:
+            t0 = time.monotonic()
+            code, out, err = self._run_capture(
+                ["--root", tmp, "run", "--prompt", "cls", "--version", "v1",
+                 "--no-cache", "--base-url", url, "--timeout", "1"])
+            elapsed = time.monotonic() - t0
+        finally:
+            close()
+        self.assertEqual(code, 2)
+        self.assertLess(elapsed, 4.0, "second case must not pay the timeout")
+        self.assertIn("error: model at", err)
+        self.assertIn("timed out after 1s", err)
+        self.assertIn("--timeout", err)
+        self.assertIn("stopped at case 'neg'; no further case was run", err)
+        self.assertEqual(out, "")
+        # the runner API: results stop at the failing case
+        results, _ = runner_mod.run_suite(
+            tmp, "cls", "v1", model_kw={"base_url": "http://127.0.0.1:1/v1"},
+            use_cache=False)
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].error)
+        results, _ = runner_mod.run_suite(
+            tmp, "cls", "v1", model_kw={"base_url": "http://127.0.0.1:1/v1"},
+            use_cache=False, fail_fast=False)
+        self.assertEqual(len(results), 2)
+        # env default and the built-in default
+        self.assertEqual(model_mod._cfg()["timeout"], model_mod.DEFAULT_TIMEOUT)
+        old = os.environ.get("PROMPTREGRESS_TIMEOUT")
+        os.environ["PROMPTREGRESS_TIMEOUT"] = "7"
+        try:
+            self.assertEqual(model_mod._cfg()["timeout"], 7.0)
+        finally:
+            if old is None:
+                del os.environ["PROMPTREGRESS_TIMEOUT"]
+            else:
+                os.environ["PROMPTREGRESS_TIMEOUT"] = old
+
+    def test_run_all(self):
+        # One command for CI: every prompt x every version, a summary
+        # table, exit 1 when any case fails.
+        tmp = tempfile.mkdtemp()
+        make_suite(tmp)
+        cli_mod.scaffold_example(tmp)  # sentiment v1/v2 too
+        server, url = start_fake_model({
+            "Classify sentiment": "positive",  # cls.v2 breaks the neg case
+            "terrible": "negative", "great": "positive",
+            **demo_mod.DEMO_ROUTES})
+        try:
+            code, out, err = self._run_capture(
+                ["--root", tmp, "--base-url", url, "run", "--all",
+                 "--no-cache"])
+            self.assertEqual(code, 1, err)
+            self.assertIn("cls.v1: ..", out)
+            self.assertIn("cls.v2: F.", out)
+            self.assertIn("sentiment.v1: ...", out)
+            self.assertIn("sentiment.v2: ..F", out)
+            lines = out.splitlines()
+            self.assertIn("suite         passed", lines)
+            self.assertIn("cls.v1        2/2", lines)
+            self.assertIn("cls.v2        1/2  FAIL", lines)
+            self.assertIn("sentiment.v2  2/3  FAIL", lines)
+            self.assertIn("4 suite(s), 2 with failures; 8/10 cases passed", out)
+            code, out, err = self._run_capture(
+                ["--root", tmp, "--base-url", url, "run", "--all",
+                 "--no-cache", "--format", "json"])
+            self.assertEqual(code, 1)
+            data = json.loads(out)
+            self.assertEqual([(s["prompt"], s["version"]) for s in data["suites"]],
+                             [("cls", "v1"), ("cls", "v2"),
+                              ("sentiment", "v1"), ("sentiment", "v2")])
+            self.assertEqual((data["passed"], data["failed"]), (8, 2))
+        finally:
+            server.shutdown()
+        # all green -> exit 0
+        tmp2 = tempfile.mkdtemp()
+        make_suite(tmp2)
+        server, url = start_fake_model({"terrible": "negative",
+                                        "great": "positive"})
+        try:
+            code, out, err = self._run_capture(
+                ["--root", tmp2, "--base-url", url, "run", "--all",
+                 "--no-cache"])
+        finally:
+            server.shutdown()
+        self.assertEqual(code, 0, err)
+        self.assertIn("2 suite(s), 0 with failures; 4/4 cases passed", out)
+        # a dead model stops the whole thing with the real reason
+        code, out, err = self._run_capture(
+            ["--root", tmp2, "--base-url", "http://127.0.0.1:1/v1", "run",
+             "--all", "--no-cache"])
+        self.assertEqual(code, 2)
+        self.assertIn("error: model unreachable", err)
+        self.assertEqual(out, "")
+        # neither --all nor --prompt/--version: usage error, exit 2
+        code, out, err = self._run_capture(["--root", tmp2, "run"])
+        self.assertEqual(code, 2)
+        self.assertIn("--all", err)
+        # no prompts at all
+        code, out, err = self._run_capture(
+            ["--root", tempfile.mkdtemp(), "run", "--all"])
+        self.assertEqual(code, 2)
+        self.assertIn("no prompts found", err)
+
+    def test_demo_run_all_scaffolds(self):
+        tmp = tempfile.mkdtemp()
+        os.environ.pop("PROMPTREGRESS_BASE_URL", None)
+        code, out, err = self._run_capture(
+            ["--root", tmp, "--demo", "run", "--all"])
+        self.assertEqual(code, 1, err)  # the demo v2 regression
+        self.assertIn("scaffolded example prompts", err)
+        self.assertIn("sentiment.v1  3/3", out)
+        self.assertIn("sentiment.v2  2/3  FAIL", out)
+
+    def test_cache_helpers_are_shared(self):
+        # response and judge-verdict entries go through one read/write pair
+        tmp = tempfile.mkdtemp()
+        runner_mod._cache_write(tmp, "k1", {"output": "o"})
+        runner_mod._cache_write(tmp, "judge-k2", {"passed": True, "detail": "d"})
+        self.assertEqual(runner_mod._cache_read(tmp, "k1"), {"output": "o"})
+        self.assertEqual(runner_mod._cache_read(tmp, "judge-k2"),
+                         {"passed": True, "detail": "d"})
+        self.assertIsNone(runner_mod._cache_read(tmp, "missing"))
+        with open(runner_mod._cache_path(tmp, "k1"), "w") as f:
+            f.write("not json")
+        self.assertIsNone(runner_mod._cache_read(tmp, "k1"))
+        self.assertFalse(hasattr(runner_mod, "_judge_cache_get"))
 
 
 if __name__ == "__main__":

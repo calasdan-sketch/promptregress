@@ -59,9 +59,16 @@ def start_fake_model(routes: dict[str, str], default: str = "ok"):
     return server, url
 
 
-# Routes matching the example scaffolded by `promptregress init`, so the
-# --demo trial passes out of the box (sentiment one-word answers).
+# Routes matching the example scaffolded by `promptregress init`
+# (first matching key wins). v1 answers every case in one word; v2 — the
+# reworded prompt — starts chatting on the neutral review, so `--demo diff
+# v1 v2` and `--demo run --version v2` show the regression the README
+# describes. The v2 key is the tail of the rendered v2 prompt, so only
+# v2 + the neutral review hits it.
+CHATTY_NEUTRAL = ("I'd call this one neutral, leaning slightly positive: "
+                  "the customer seems satisfied but not enthusiastic.")
 DEMO_ROUTES = {
+    "No other text.\n\nReview: It's fine, nothing special.": CHATTY_NEUTRAL,
     "Terrible quality": "negative",
     "works perfectly": "positive",
     "nothing special": "neutral",

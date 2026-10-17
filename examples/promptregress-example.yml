@@ -27,11 +27,13 @@ jobs:
         run: pip install git+https://github.com/calasdan-sketch/promptregress
       - name: Prompt regression tests (demo mode, fake model)
         run: promptregress --demo run --prompt sentiment --version v1
-      # Real model instead of the demo (exit 1 = a case failed,
-      # exit 2 = model unreachable / bad cases file):
+      # Real model instead of the demo: every prompt x every version in one
+      # go (exit 1 = a case failed, exit 2 = model unreachable / bad cases
+      # file; the first unanswered case stops the run, --timeout caps each
+      # request):
       # - name: Prompt regression tests
       #   env:
       #     PROMPTREGRESS_BASE_URL: ${{ secrets.PROMPTREGRESS_BASE_URL }}
       #     PROMPTREGRESS_API_KEY: ${{ secrets.PROMPTREGRESS_API_KEY }}
       #     PROMPTREGRESS_MODEL: llama3.1
-      #   run: promptregress run --prompt <your-prompt> --version v2 --no-cache
+      #   run: promptregress run --all --no-cache --timeout 60

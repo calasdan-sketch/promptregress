@@ -32,7 +32,8 @@ sentiment.v2: ..F
 2/3 passed
 ```
 
-Exit code 1, so CI blocks the merge.
+Exit code 1, so CI blocks the merge. (Both outputs above are what
+`--demo` prints — try them before pointing it at a model.)
 
 ## Install
 
@@ -46,9 +47,10 @@ Or from a clone:
 
 ```bash
 git clone https://github.com/calasdan-sketch/promptregress && cd promptregress
-pip install .   # puts the `promptregress` console script on PATH
+pip install .
 ```
 
+Either way pip puts the `promptregress` command on your PATH, on every OS.
 Or run without installing: `python3 -m promptregress` from the repo root.
 
 ## Quick start
@@ -57,6 +59,7 @@ Or run without installing: `python3 -m promptregress` from the repo root.
 promptregress init                                       # scaffold prompts/ with an example
 promptregress --demo run --prompt sentiment --version v1 # zero-setup trial, no model needed
 promptregress --demo diff v1 v2 --prompt sentiment       # A/B on the same golden cases
+promptregress run --all                                  # every prompt x every version (CI)
 promptregress list
 ```
 
@@ -68,10 +71,12 @@ flag once `PROMPTREGRESS_BASE_URL` points at your real endpoint (see
 below).
 
 The example `sentiment` prompt is a one-word sentiment classifier
-(`sentiment.v1.txt`, `sentiment.v2.txt`, `sentiment.cases.yaml`); a run
-prints `sentiment.v1: ...` followed by `3/3 passed`. `init` also writes
-`.promptregress/.gitignore`, so the response cache never ends up in a
-commit.
+(`sentiment.v1.txt`, `sentiment.v2.txt`, `sentiment.cases.yaml`); a `v1`
+run prints `sentiment.v1: ...` followed by `3/3 passed`, and `v2` shows the
+regression at the top of this page (the fake model "chats" on the neutral
+review for v2, so `diff v1 v2` flips one verdict and `run --version v2`
+exits 1). `init` also writes `.promptregress/.gitignore`, so the response
+cache never ends up in a commit.
 
 (Haven't installed it yet? Prefix every command with `python3 -m`
 from the repo checkout, e.g. `python3 -m promptregress init`.)
@@ -116,17 +121,25 @@ cases:
 
 Multi-line inputs use YAML block scalars: literal `|` keeps line breaks
 (and trailing spaces), folded `>` joins lines with spaces; add `-` to strip
-or `+` to keep trailing newlines (`|-`, `>+`). The cases file is read by a
-small built-in YAML subset parser (no PyYAML needed); anchors, aliases,
-tags, flow maps (`{...}` as a value) and explicit indentation indicators
-(`|2`) are rejected with a line-numbered error.
+or `+` to keep trailing newlines (`|-`, `>+`). Double-quoted strings take
+the JSON escapes (`"line1\nline2"`, `\t`, `\"`, `\\`, `\u00e9`); single-quoted
+strings are literal. The cases file is read by a small built-in YAML subset
+parser (no PyYAML needed); anchors, aliases, tags, flow maps (`{...}` as a
+value) and explicit indentation indicators (`|2`) are rejected with a
+line-numbered error.
+
+Mind YAML's plain scalars in assertions: `contains: yes` is the boolean
+`true`, `contains: ~` is null. Those (and an invalid `regex`) are reported
+per case as `bad assertion: …` with the fix — quote the text:
+`contains: "yes"`. Plain numbers are fine (`contains: 1` means the text
+"1"; `max_tokens: "10"` is accepted as 10).
 
 ## Assertions (deterministic, no LLM)
 
 `contains` · `not_contains` · `regex` · `not_regex` · `starts_with` ·
 `ends_with` · `json_valid` · `schema` (mini validator: type, required,
-properties, items, enum) · `max_tokens` · `min_tokens` (whitespace estimate,
-documented as approximate).
+properties, items, enum) · `max_tokens` · `min_tokens` (a rough estimate of
+one token per 4 characters — a guardrail, not a tokenizer).
 
 Plus an optional LLM judge:
 
@@ -143,14 +156,18 @@ Zero dependencies — plain stdlib HTTP against any OpenAI-compatible API:
 | Env | Default | Notes |
 |---|---|---|
 | `PROMPTREGRESS_BASE_URL` | `http://localhost:11434/v1` | Ollama, LM Studio, freellmapi… |
-| `PROMPTREGRESS_API_KEY` | `ollama` | |
+| `PROMPTREGRESS_API_KEY` | `ollama` | prefer the env var: a key given as `--api-key` is visible to other users via `ps` and your shell history |
 | `PROMPTREGRESS_MODEL` | `llama3.1` | |
+| `PROMPTREGRESS_TIMEOUT` | `60` | seconds per request |
 
-Flags `--model`, `--base-url`, `--api-key` override env. Temperature is 0
-for determinism. If the model cannot be used, `run`/`diff` exit 2 with the
-real reason instead of an all-FAIL table — `model unreachable at …`,
-`answered HTTP 401 Unauthorized: Invalid API key`, `answered HTTP 404 Not
-Found`, `timed out after 120s`.
+Flags `--model`, `--base-url`, `--api-key`, `--timeout` (and `--demo`)
+override env; they are accepted before or after the subcommand
+(`promptregress --base-url … run …` and `promptregress run … --base-url …`
+mean the same). Temperature is 0 for determinism. If the model cannot be
+used, `run`/`diff` exit 2 with the real reason instead of an all-FAIL
+table — `model unreachable at …`, `answered HTTP 401 Unauthorized: Invalid
+API key`, `answered HTTP 404 Not Found`, `timed out after 60s` — and stop
+at that case: a hung endpoint costs one timeout, not one per case.
 
 ## Caching
 
@@ -168,12 +185,33 @@ cached run), so it stays out of your commits.
 ## CI
 
 ```bash
-promptregress run --prompt sentiment --version v2 --format json
+promptregress run --all            # every prompt against each of its versions
 ```
 
-Exit 1 on any failing case (human and `--format json` alike), 2 on errors
-(missing prompt, malformed cases YAML, model unreachable or rejecting the
-call).
+```
+sentiment.v1: ...
+
+3/3 passed
+
+sentiment.v2: ..F
+
+  FAIL neutral review
+    ✗ {'max_tokens': 10} -> ~26 tokens (max 10)
+    output: "I'd call this one neutral, leaning slightly positive: the customer seems satisfied but not enthusiastic."
+
+2/3 passed
+
+suite         passed
+sentiment.v1  3/3
+sentiment.v2  2/3  FAIL
+
+2 suite(s), 1 with failures; 5/6 cases passed
+```
+
+Exit 1 on any failing case (human and `--format json` alike — the JSON
+form lists every suite with its cases), 2 on errors (missing prompt,
+malformed cases YAML, model unreachable or rejecting the call). A single
+version is `promptregress run --prompt sentiment --version v2`.
 
 Ready-to-copy GitHub Actions workflow:
 [`examples/promptregress-example.yml`](examples/promptregress-example.yml).
@@ -182,7 +220,8 @@ demo mode answers with a fake model that only knows the scaffolded
 `sentiment` example, so it checks the install and wiring, not your
 prompts. To gate on real prompts, point `PROMPTREGRESS_BASE_URL` (and
 `PROMPTREGRESS_API_KEY`) at a model reachable from the runner via repo
-secrets and drop `--demo` (commented step in the file).
+secrets and run `promptregress run --all` without `--demo` (commented step
+in the file).
 
 This repo's own CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml))
 installs the package and runs the test suite on Ubuntu, Windows and macOS
@@ -195,7 +234,7 @@ YAML and a CLI — the solo-dev "just run my 30 golden cases in CI" slot.
 
 ## Tests
 
-75/75 pass: `python3 -m unittest discover -s tests`
+89/89 pass: `python3 -m unittest discover -s tests`
 (free — tests run against a fake in-process model server, no API spend)
 
 ## License

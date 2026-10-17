@@ -7,6 +7,7 @@ Config (env or flags):
   PROMPTREGRESS_BASE_URL  default http://localhost:11434/v1 (Ollama)
   PROMPTREGRESS_API_KEY   default "ollama" (Ollama needs none)
   PROMPTREGRESS_MODEL     default llama3.1
+  PROMPTREGRESS_TIMEOUT   default 60 (seconds per request; --timeout)
 """
 
 from __future__ import annotations
@@ -15,6 +16,9 @@ import json
 import os
 import urllib.request
 import urllib.error
+
+
+DEFAULT_TIMEOUT = 60.0
 
 
 class ModelError(RuntimeError):
@@ -40,18 +44,33 @@ def _http_detail(e: urllib.error.HTTPError) -> str:
     return " ".join(body.split())[:200]
 
 
-def _cfg(base_url=None, api_key=None, model=None):
+def _cfg(base_url=None, api_key=None, model=None, timeout=None):
+    if timeout is None:
+        try:
+            timeout = float(os.environ.get("PROMPTREGRESS_TIMEOUT")
+                            or DEFAULT_TIMEOUT)
+        except ValueError:
+            timeout = DEFAULT_TIMEOUT
     return {
         "base_url": (base_url or os.environ.get("PROMPTREGRESS_BASE_URL")
                      or "http://localhost:11434/v1").rstrip("/"),
         "api_key": api_key or os.environ.get("PROMPTREGRESS_API_KEY") or "ollama",
         "model": model or os.environ.get("PROMPTREGRESS_MODEL") or "llama3.1",
+        "timeout": timeout,
     }
 
 
+def _fmt_seconds(t: float) -> str:
+    return f"{t:g}s"
+
+
 def complete(prompt: str, *, base_url=None, api_key=None, model=None,
-             temperature: float = 0.0, timeout: int = 120) -> str:
-    cfg = _cfg(base_url, api_key, model)
+             temperature: float = 0.0, timeout: float | None = None) -> str:
+    """One chat completion. `timeout` (seconds, connect and read) defaults
+    to PROMPTREGRESS_TIMEOUT or 60: a hung endpoint fails one request,
+    not the whole suite times 120 s."""
+    cfg = _cfg(base_url, api_key, model, timeout)
+    timeout = cfg["timeout"]
     body = json.dumps({
         "model": cfg["model"],
         "messages": [{"role": "user", "content": prompt}],
@@ -77,7 +96,9 @@ def complete(prompt: str, *, base_url=None, api_key=None, model=None,
             f"(set PROMPTREGRESS_BASE_URL / --base-url)")
     except TimeoutError:  # read timeout is raised bare, not as URLError
         raise ModelError(
-            f"model at {cfg['base_url']} timed out after {timeout}s")
+            f"model at {cfg['base_url']} timed out after "
+            f"{_fmt_seconds(timeout)} (raise it with --timeout / "
+            f"PROMPTREGRESS_TIMEOUT)")
     except (json.JSONDecodeError, KeyError) as e:
         raise ModelError(f"bad response from model: {e}")
     try:

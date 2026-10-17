@@ -6,14 +6,10 @@ Handles the subset these tools need:
   - flow-style lists of scalars ("[a, b]")
   - block scalars: literal "|" and folded ">", with "-" (strip) and "+"
     (keep) chomping, as a mapping value or list item
-  - scalars: quoted strings, ints, floats, bools, null
+  - scalars: quoted strings (double quotes take the JSON escapes:
+    backslash-n, backslash-t, escaped quote and backslash, backslash-uXXXX),
+    ints, floats, bools, null
   - "#" comments (outside quotes)
-
-SHARED COPY: the canonical version lives here in adr_drift/miniyaml.py.
-pr_verify and promptregress carry verbatim copies (see their headers).
-Do not fork — fix the canonical copy and re-copy.
-(promptregress copy is ahead: it adds | and > block scalars — port them
-to the canonical copy.)
 
 NOT supported (raises ValueError): anchors, aliases, tags, block-scalar
 indentation indicators ("|2"), flow maps, duplicate keys. Configs using them get a
@@ -30,6 +26,7 @@ Strictness notes:
 
 from __future__ import annotations
 
+import json
 import re
 
 _KEY_RE = re.compile(r"^([A-Za-z0-9_.\-/ ]+):(?:\s|$)")
@@ -65,7 +62,13 @@ def _scalar(s: str):
     if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
         inner = s[1:-1]
         if s[0] == '"':
-            inner = inner.replace('\\"', '"').replace("\\\\", "\\")
+            # Double-quoted scalars use the JSON escape set (\n, \t, \",
+            # \\, \uXXXX); anything JSON rejects (a YAML-only escape such
+            # as \e) keeps the old \" and \\ handling.
+            try:
+                return json.loads(s)
+            except ValueError:
+                inner = inner.replace('\\"', '"').replace("\\\\", "\\")
         return inner
     low = s.lower()
     if low in ("null", "~", "none", ""):

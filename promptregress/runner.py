@@ -71,23 +71,26 @@ def _cache_path(root: str, key: str) -> str:
     return os.path.join(root, CACHE_DIR, key + ".json")
 
 
-def _cache_get(root: str, key: str) -> str | None:
+def _cache_read(root: str, key: str) -> dict | None:
+    """The cached JSON object for key, or None when absent/unreadable.
+    Shared by response and judge-verdict entries."""
     p = _cache_path(root, key)
-    if os.path.isfile(p):
-        try:
-            with open(p, encoding="utf-8") as f:
-                return json.load(f)["output"]
-        except (json.JSONDecodeError, KeyError, OSError):
-            return None
-    return None
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
-def _cache_put(root: str, key: str, output: str) -> None:
+def _cache_write(root: str, key: str, payload: dict) -> None:
     p = _cache_path(root, key)
     os.makedirs(os.path.dirname(p), exist_ok=True)
     ensure_cache_ignored(root)
     with open(p, "w", encoding="utf-8") as f:
-        json.dump({"output": output}, f)
+        json.dump(payload, f)
 
 
 def _provider(model_kw: dict) -> tuple[str, str]:
@@ -110,27 +113,6 @@ def _judge_key(prompt_name: str, version: str, case_name: str,
     return "judge-" + h.hexdigest()[:32]
 
 
-def _judge_cache_get(root: str, key: str) -> tuple[bool, str] | None:
-    p = _cache_path(root, key)
-    if os.path.isfile(p):
-        try:
-            with open(p, encoding="utf-8") as f:
-                d = json.load(f)
-            return bool(d["passed"]), str(d["detail"])
-        except (json.JSONDecodeError, KeyError, OSError, TypeError):
-            return None
-    return None
-
-
-def _judge_cache_put(root: str, key: str, passed: bool,
-                     detail: str) -> None:
-    p = _cache_path(root, key)
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    ensure_cache_ignored(root)
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump({"passed": passed, "detail": detail}, f)
-
-
 def run_case(root: str, prompt_name: str, version: str, prompt_text: str,
              case: dict, model_kw: dict, use_cache: bool = True,
              judge_model_kw: dict | None = None) -> CaseResult:
@@ -139,9 +121,9 @@ def run_case(root: str, prompt_name: str, version: str, prompt_text: str,
                               model_name, base_url)
     cached = False
     if use_cache:
-        hit = _cache_get(root, key)
-        if hit is not None:
-            output, cached = hit, True
+        hit = _cache_read(root, key)
+        if hit is not None and isinstance(hit.get("output"), str):
+            output, cached = hit["output"], True
     if not cached:
         rendered = suite_mod.render(prompt_text, case["input"],
                                     case.get("vars"))
@@ -151,7 +133,7 @@ def run_case(root: str, prompt_name: str, version: str, prompt_text: str,
             return CaseResult(name=case["name"], passed=False, output="",
                               assertions=[], error=str(e))
         if use_cache:  # same contract as judge verdicts: off = no I/O
-            _cache_put(root, key, output)
+            _cache_write(root, key, {"output": output})
 
     results: list[AssertionResult] = []
     for assertion in case["assert"]:
@@ -161,9 +143,9 @@ def run_case(root: str, prompt_name: str, version: str, prompt_text: str,
             jkey = _judge_key(prompt_name, version, case["name"],
                               output, rubric,
                               "|".join(_provider(judge_model_kw or model_kw)))
-            hit = _judge_cache_get(root, jkey) if use_cache else None
-            if hit is not None:
-                passed, detail = hit
+            hit = _cache_read(root, jkey) if use_cache else None
+            if hit is not None and "passed" in hit and "detail" in hit:
+                passed, detail = bool(hit["passed"]), str(hit["detail"])
             else:
                 try:
                     passed, detail = model_mod.judge(
@@ -173,7 +155,8 @@ def run_case(root: str, prompt_name: str, version: str, prompt_text: str,
                     passed, detail = False, f"judge unavailable: {e}"
                 else:
                     if use_cache:
-                        _judge_cache_put(root, jkey, passed, detail)
+                        _cache_write(root, jkey,
+                                     {"passed": passed, "detail": detail})
             results.append(AssertionResult(assertion, passed, detail))
             continue
         try:
@@ -189,10 +172,24 @@ def run_case(root: str, prompt_name: str, version: str, prompt_text: str,
 def run_suite(root: str, prompt_name: str, version: str,
               cases: list[dict] | None = None,
               model_kw: dict | None = None,
-              use_cache: bool = True) -> tuple[list[CaseResult], str]:
+              use_cache: bool = True,
+              fail_fast: bool = True) -> tuple[list[CaseResult], str]:
+    """Run every case of prompt_name against `version`.
+
+    fail_fast (default): the first case the model could not answer
+    (unreachable, timeout, HTTP 401/404 ...) ends the run — the remaining
+    cases would only repeat the same error, each paying the timeout
+    again. The returned list is then shorter than the case list; its
+    last entry carries the error.
+    """
     prompt_text = suite_mod.load_prompt(root, prompt_name, version)
     cases = cases if cases is not None else suite_mod.load_cases(root,
                                                                  prompt_name)
-    results = [run_case(root, prompt_name, version, prompt_text, c,
-                        model_kw or {}, use_cache) for c in cases]
+    results = []
+    for c in cases:
+        r = run_case(root, prompt_name, version, prompt_text, c,
+                     model_kw or {}, use_cache)
+        results.append(r)
+        if fail_fast and r.error:
+            break
     return results, prompt_text

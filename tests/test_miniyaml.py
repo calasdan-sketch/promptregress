@@ -107,6 +107,30 @@ class TestStrictMalformed(unittest.TestCase):
         self.assertEqual(miniyaml.safe_load("g: 'a: b'"), {"g": "a: b"})
 
 
+class TestQuotedScalars(unittest.TestCase):
+    # Double-quoted scalars take the JSON escape set (PyYAML agrees on
+    # these); only \" and \\ were unescaped before.
+    def test_double_quoted_escapes(self):
+        self.assertEqual(miniyaml.safe_load('a: "line1\\nline2"'),
+                         {"a": "line1\nline2"})
+        self.assertEqual(miniyaml.safe_load('a: "tab\\tsep"'), {"a": "tab\tsep"})
+        self.assertEqual(miniyaml.safe_load('a: "say \\"hi\\" \\\\ done"'),
+                         {"a": 'say "hi" \\ done'})
+        self.assertEqual(miniyaml.safe_load('a: "caf\\u00e9"'), {"a": "caf\u00e9"})
+        self.assertEqual(miniyaml.safe_load('- "x\\ny"'), ["x\ny"])
+        self.assertEqual(miniyaml.safe_load('a: ["p\\nq", r]'), {"a": ["p\nq", "r"]})
+
+    def test_double_quoted_fallback_and_single_quotes(self):
+        # an escape JSON does not know keeps the old minimal handling
+        self.assertEqual(miniyaml.safe_load('a: "odd \\e esc \\"q\\""'),
+                         {"a": 'odd \\e esc "q"'})
+        # single quotes are literal, as in YAML
+        self.assertEqual(miniyaml.safe_load("a: 'no \\n escape'"),
+                         {"a": "no \\n escape"})
+        self.assertEqual(miniyaml.safe_load('a: "# not a comment"'),
+                         {"a": "# not a comment"})
+
+
 class TestBlockScalars(unittest.TestCase):
     # Expected values match PyYAML 6 on the same documents.
     def test_literal_clip(self):
