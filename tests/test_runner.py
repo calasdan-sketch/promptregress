@@ -1,11 +1,14 @@
 """Runner + CLI tests against the fake model server."""
 
+import glob
 import io
 import json
 import os
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest import mock
 
 from promptregress import cli as cli_mod
@@ -16,6 +19,26 @@ from promptregress import runner as runner_mod
 from promptregress import suite as suite_mod
 
 from promptregress.demo import start_fake_model
+
+
+def start_error_server(status: int, body: str):
+    """An endpoint that answers every POST with `status` and `body`."""
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            payload = body.encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_port}/v1"
 
 
 def make_suite(tmp: str) -> None:
@@ -465,6 +488,142 @@ class TestCLI(unittest.TestCase):
                 cli_mod.main(["--version"])
         self.assertEqual(ctx.exception.code, 0)
         self.assertIn("promptregress", out_buf.getvalue())
+
+    # ---- round-2 release-panel regressions ----
+
+    def _run_capture(self, argv):
+        out_buf, err_buf = io.StringIO(), io.StringIO()
+        with redirect_stdout(out_buf), redirect_stderr(err_buf):
+            code = cli_mod.main(argv)
+        return code, out_buf.getvalue(), err_buf.getvalue()
+
+    def test_demo_ignores_base_url_env(self):
+        # PROMPTREGRESS_BASE_URL in the environment used to override
+        # --demo, so the "zero-setup trial" silently hit a real (here:
+        # dead) server. --demo must always use the fake model, and say
+        # once that the variable is being ignored.
+        tmp = tempfile.mkdtemp()
+        old = os.environ.get("PROMPTREGRESS_BASE_URL")
+        os.environ["PROMPTREGRESS_BASE_URL"] = "http://127.0.0.1:1/v1"
+        try:
+            code, out, err = self._run_capture(
+                ["--root", tmp, "--demo", "run", "--prompt", "sentiment",
+                 "--version", "v1"])
+        finally:
+            if old is None:
+                del os.environ["PROMPTREGRESS_BASE_URL"]
+            else:
+                os.environ["PROMPTREGRESS_BASE_URL"] = old
+        self.assertEqual(code, 0, err)
+        self.assertIn("3/3 passed", out)
+        self.assertNotIn("unreachable", err)
+        self.assertEqual(err.count("ignoring PROMPTREGRESS_BASE_URL="), 1)
+        # an explicit --base-url is ignored in --demo too, and said so
+        code, out, err = self._run_capture(
+            ["--root", tmp, "--demo", "--base-url", "http://127.0.0.1:1/v1",
+             "run", "--prompt", "sentiment", "--version", "v1"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("3/3 passed", out)
+        self.assertIn("ignoring --base-url http://127.0.0.1:1/v1", err)
+
+    def test_model_errors_show_status_and_message(self):
+        # Every ModelError printed the same "model unreachable; set
+        # PROMPTREGRESS_BASE_URL" line, so a bad API key (401), a wrong
+        # path (404) and a dead host were indistinguishable.
+        tmp = tempfile.mkdtemp()
+        cli_mod.scaffold_example(tmp)
+        argv = ["run", "--prompt", "sentiment", "--version", "v1",
+                "--no-cache"]
+        server, url = start_error_server(
+            401, '{"error": {"message": "Invalid API key", "type": "auth"}}')
+        try:
+            code, out, err401 = self._run_capture(
+                ["--root", tmp, "--base-url", url, *argv])
+        finally:
+            server.shutdown()
+        self.assertEqual(code, 2)
+        self.assertIn("error: model at http://127.0.0.1:", err401)
+        self.assertIn("HTTP 401 Unauthorized: Invalid API key", err401)
+        self.assertNotIn("unreachable", err401)
+        self.assertEqual(out, "")  # no all-FAIL run printed
+        # 404: the fake model only serves /v1/chat/completions
+        server, url = start_fake_model({})
+        try:
+            code, out, err404 = self._run_capture(
+                ["--root", tmp, "--base-url", url.replace("/v1", ""), *argv])
+        finally:
+            server.shutdown()
+        self.assertEqual(code, 2)
+        self.assertIn("HTTP 404 Not Found", err404)
+        self.assertNotIn("<html", err404.lower())  # HTML page not dumped
+        # connection refused keeps the "unreachable" wording and the hint
+        code, out, errdead = self._run_capture(
+            ["--root", tmp, "--base-url", "http://127.0.0.1:1/v1", *argv])
+        self.assertEqual(code, 2)
+        self.assertIn("error: model unreachable at http://127.0.0.1:1/v1",
+                      errdead)
+        self.assertIn("PROMPTREGRESS_BASE_URL", errdead)
+        self.assertEqual(len({err401, err404, errdead}), 3)
+        # diff reports the same real reason
+        server, url = start_error_server(401, '{"error": "nope"}')
+        try:
+            code, out, err = self._run_capture(
+                ["--root", tmp, "--base-url", url, "diff", "v1", "v2",
+                 "--prompt", "sentiment", "--no-cache"])
+        finally:
+            server.shutdown()
+        self.assertEqual(code, 2)
+        self.assertIn("HTTP 401 Unauthorized: nope", err)
+        self.assertNotIn("CHANGED", out)
+
+    def test_demo_scaffold_dir_is_removed(self):
+        # --demo scaffolded into tempfile.mkdtemp() and never cleaned up:
+        # one promptregress-demo-* dir per trial run piled up in /tmp.
+        pattern = os.path.join(tempfile.gettempdir(), "promptregress-demo-*")
+        before = set(glob.glob(pattern))
+        tmp = tempfile.mkdtemp()
+        os.environ.pop("PROMPTREGRESS_BASE_URL", None)
+        code, out, err = self._run_capture(
+            ["--root", tmp, "--demo", "diff", "v1", "v2",
+             "--prompt", "sentiment"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("scaffolded example prompts in", err)
+        self.assertEqual(set(glob.glob(pattern)) - before, set())
+        scaffolded = err.split("scaffolded example prompts in ", 1)[1]
+        scaffolded = scaffolded.split(";", 1)[0]
+        self.assertFalse(os.path.exists(scaffolded), scaffolded)
+
+    def test_demo_json_output_is_pure_json(self):
+        # the scaffold notice goes to stderr so --format json stays parseable
+        tmp = tempfile.mkdtemp()
+        os.environ.pop("PROMPTREGRESS_BASE_URL", None)
+        code, out, err = self._run_capture(
+            ["--root", tmp, "--demo", "run", "--prompt", "sentiment",
+             "--version", "v1", "--format", "json"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["failed"], 0)
+
+    def test_init_writes_cache_gitignore(self):
+        tmp = tempfile.mkdtemp()
+        code, out, _ = self._run_capture(["--root", tmp, "init"])
+        self.assertEqual(code, 0)
+        p = os.path.join(tmp, ".promptregress", ".gitignore")
+        self.assertTrue(os.path.isfile(p))
+        with open(p, encoding="utf-8") as f:
+            self.assertIn("*\n!.gitignore\n", f.read())
+        self.assertIn(".promptregress/.gitignore", out)
+        # a run that fills the cache in a fresh clone creates it too
+        tmp2 = tempfile.mkdtemp()
+        make_suite(tmp2)
+        server, url = start_fake_model({"terrible": "negative",
+                                        "great": "positive"})
+        try:
+            runner_mod.run_suite(tmp2, "cls", "v1", model_kw={
+                "base_url": url, "api_key": "x", "model": "fake"})
+        finally:
+            server.shutdown()
+        self.assertTrue(os.path.isfile(
+            os.path.join(tmp2, ".promptregress", ".gitignore")))
 
 
 if __name__ == "__main__":

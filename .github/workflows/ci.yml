@@ -1,0 +1,29 @@
+# Test suite for promptregress itself: install the package, run the tests.
+# Stdlib only, so there is nothing else to install; the tests talk to an
+# in-process fake model, so no API key or network is needed.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: pip install .
+      - name: Test
+        run: python -m unittest discover -s tests
+      - name: Smoke-test the console script
+        run: promptregress --demo run --prompt sentiment --version v1

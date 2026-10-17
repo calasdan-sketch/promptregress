@@ -152,6 +152,28 @@ class TestBlockScalars(unittest.TestCase):
         self.assertEqual(miniyaml.safe_load("a: |\r\n  x\r\n  y\r\n"),
                          {"a": "x\ny\n"})
 
+    def test_literal_keeps_trailing_spaces(self):
+        # Body lines were rstrip()ped, dropping trailing spaces (and the
+        # spaces of a whitespace-only line that is more indented than the
+        # block). Expected values match PyYAML 6.
+        self.assertEqual(miniyaml.safe_load("a: |\n  x  \n  y\n"),
+                         {"a": "x  \ny\n"})
+        self.assertEqual(miniyaml.safe_load("a: |-\n  x  \n"), {"a": "x  "})
+        self.assertEqual(miniyaml.safe_load("- |\n  x \n  y\n- z\n"),
+                         ["x \ny\n", "z"])
+        self.assertEqual(miniyaml.safe_load("a: |\n  x\n    \n  y\n"),
+                         {"a": "x\n  \ny\n"})
+        self.assertEqual(miniyaml.safe_load("a: |\n  x\n    \n"),
+                         {"a": "x\n  \n"})
+        self.assertEqual(miniyaml.safe_load("a: >\n  one  \n  two\n"),
+                         {"a": "one   two\n"})
+        # a whitespace-only line at or below the parent indent is still an
+        # empty line inside the block, not its end
+        self.assertEqual(
+            miniyaml.safe_load("k:\n  a: |\n    x\n  \n    y\n  b: 1\n"),
+            {"k": {"a": "x\n\ny\n", "b": 1}})
+        self.assertEqual(miniyaml.safe_load("a: |\n  x\n \n"), {"a": "x\n"})
+
     def test_multiline_case_input(self):
         doc = ("cases:\n  - name: long review\n    input: |\n"
                "      Line one.\n        Indented line.\n      Line three.\n"

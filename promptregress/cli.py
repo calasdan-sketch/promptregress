@@ -15,6 +15,7 @@ diff versions A/B, and catch prompt drift before your users do.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -89,6 +90,9 @@ def cmd_init(args) -> int:
         print(f"scaffolded prompts/: {', '.join(written)}")
     else:
         print("prompts/ already scaffolded")
+    if runner_mod.ensure_cache_ignored(args.root):
+        print(f"wrote {runner_mod.CACHE_ROOT}/.gitignore "
+              "(the response cache is never committed)")
     print("Point PROMPTREGRESS_BASE_URL at your model "
           "(default: Ollama at http://localhost:11434/v1).")
     return 0
@@ -97,15 +101,19 @@ def cmd_init(args) -> int:
 def _demo_root(args) -> str:
     """Root for a --demo run. Uses the real prompts/ when the requested
     prompt+version exists there; otherwise scaffolds the example into a
-    temp dir so the trial works with zero setup."""
+    temp dir (removed when the command ends) so the trial works with
+    zero setup."""
     have = suite_mod.list_prompts(args.root).get(args.prompt, [])
     if args.cmd == "run" and args.version in have:
         return args.root
     if args.cmd == "diff" and args.v1 in have and args.v2 in have:
         return args.root
-    tmp = tempfile.mkdtemp(prefix="promptregress-demo-")
+    stack = getattr(args, "cleanup", None) or contextlib.ExitStack()
+    tmp = stack.enter_context(tempfile.TemporaryDirectory(
+        prefix="promptregress-demo-", ignore_cleanup_errors=True))
     scaffold_example(tmp)
-    print(f"(demo: scaffolded example prompts in {tmp})")
+    print(f"(demo: scaffolded example prompts in {tmp}; removed afterwards)",
+          file=sys.stderr)
     return tmp
 
 
@@ -160,6 +168,16 @@ def _use_cache(args) -> bool:
     return not (args.no_cache or args.demo)
 
 
+def _first_error(*result_lists) -> str:
+    """The first model error of a run (unreachable, HTTP 401/404, timeout
+    ...), or "" when every case got an answer."""
+    for results in result_lists:
+        for r in results:
+            if r.error and not r.cached:
+                return r.error
+    return ""
+
+
 def cmd_run(args) -> int:
     root = _demo_root(args) if args.demo else args.root
     try:
@@ -169,10 +187,11 @@ def cmd_run(args) -> int:
     except (FileNotFoundError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
-    if any(r.error and not r.cached for r in results):
-        # model unreachable — report, don't pretend
-        print("error: model unreachable; "
-              "set PROMPTREGRESS_BASE_URL / --base-url", file=sys.stderr)
+    err = _first_error(results)
+    if err:
+        # model down / rejected the call — report the real reason, don't
+        # pretend with an all-FAIL run
+        print(f"error: {err}", file=sys.stderr)
         return 2
     return _print_run(args.prompt, args.version, results, args.format)
 
@@ -190,10 +209,11 @@ def cmd_diff(args) -> int:
     except (FileNotFoundError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
-    if any(r.error and not r.cached for rs in (r1, r2) for r in rs):
-        # model unreachable — report, don't pretend with an all-FAIL table
-        print("error: model unreachable; "
-              "set PROMPTREGRESS_BASE_URL / --base-url", file=sys.stderr)
+    err = _first_error(r1, r2)
+    if err:
+        # model down / rejected the call — report the real reason, don't
+        # pretend with an all-FAIL table
+        print(f"error: {err}", file=sys.stderr)
         return 2
     rows = []
     for a, b in zip(r1, r2):
@@ -265,19 +285,26 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    demo_server = None
-    if args.demo and args.cmd in ("run", "diff"):
-        # Zero-dependency trial: in-process fake model. An explicit
-        # --base-url (or env) still wins — explicit intent beats the demo.
-        demo_server, url = demo_mod.start_demo_model()
-        if args.base_url is None and "PROMPTREGRESS_BASE_URL" not in os.environ:
-            os.environ["PROMPTREGRESS_BASE_URL"] = url
-    try:
+    with contextlib.ExitStack() as stack:
+        # Resources a subcommand opens (the demo's scaffold dir) are
+        # released here, however the command ends.
+        args.cleanup = stack
+        if args.demo and args.cmd in ("run", "diff"):
+            # Zero-dependency trial: ALWAYS the in-process fake model.
+            # A PROMPTREGRESS_BASE_URL left in the environment (or a
+            # --base-url) used to win silently and hit a real server.
+            demo_server, url = demo_mod.start_demo_model()
+            stack.callback(demo_server.shutdown)
+            ignored = [f"--base-url {args.base_url}"] if args.base_url else []
+            if os.environ.get("PROMPTREGRESS_BASE_URL"):
+                ignored.append("PROMPTREGRESS_BASE_URL="
+                               f"{os.environ['PROMPTREGRESS_BASE_URL']}")
+            if ignored:
+                print("(demo: using the built-in fake model; ignoring "
+                      f"{', '.join(ignored)})", file=sys.stderr)
+            args.base_url = url
         return {"init": cmd_init, "list": cmd_list,
                 "run": cmd_run, "diff": cmd_diff}[args.cmd](args)
-    finally:
-        if demo_server is not None:
-            demo_server.shutdown()
 
 
 if __name__ == "__main__":

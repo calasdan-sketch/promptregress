@@ -197,8 +197,11 @@ def _block_scalar(raw_lines, i, parent_indent, style, chomp):
     (value, index of the first line after the block)."""
     body, n = [], len(raw_lines)
     while i < n:
-        ln = raw_lines[i].rstrip()
-        if ln and len(ln) - len(ln.lstrip(" ")) <= parent_indent:
+        # Only line breaks are stripped: trailing spaces are content in a
+        # block scalar (PyYAML keeps them), and a whitespace-only line is
+        # an empty line, never the end of the block.
+        ln = raw_lines[i].rstrip("\r\n")
+        if ln.strip() and len(ln) - len(ln.lstrip(" ")) <= parent_indent:
             break
         body.append(ln)
         i += 1

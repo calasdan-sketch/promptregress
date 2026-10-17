@@ -21,6 +21,25 @@ class ModelError(RuntimeError):
     pass
 
 
+def _http_detail(e: urllib.error.HTTPError) -> str:
+    """The server's own error text: OpenAI-style {"error": {"message"}}
+    when present, else the (whitespace-collapsed) body."""
+    try:
+        body = e.read(4096).decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001 - the status line is still useful
+        return ""
+    try:
+        err = json.loads(body).get("error")
+        msg = err.get("message") if isinstance(err, dict) else err
+        if isinstance(msg, str) and msg.strip():
+            return msg.strip()
+    except (ValueError, AttributeError):
+        pass
+    if body.lstrip().startswith("<"):
+        return ""  # an HTML error page adds nothing to the status line
+    return " ".join(body.split())[:200]
+
+
 def _cfg(base_url=None, api_key=None, model=None):
     return {
         "base_url": (base_url or os.environ.get("PROMPTREGRESS_BASE_URL")
@@ -45,10 +64,20 @@ def complete(prompt: str, *, base_url=None, api_key=None, model=None,
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        # A 401 (bad key) or 404 (wrong path/model) is not "unreachable":
+        # surface the status and the server's message.
+        detail = _http_detail(e)
+        raise ModelError(
+            f"model at {cfg['base_url']} answered HTTP {e.code} {e.reason}"
+            + (f": {detail}" if detail else ""))
     except urllib.error.URLError as e:
         raise ModelError(
-            f"cannot reach model at {cfg['base_url']} "
-            f"(set PROMPTREGRESS_BASE_URL): {e.reason}")
+            f"model unreachable at {cfg['base_url']}: {e.reason} "
+            f"(set PROMPTREGRESS_BASE_URL / --base-url)")
+    except TimeoutError:  # read timeout is raised bare, not as URLError
+        raise ModelError(
+            f"model at {cfg['base_url']} timed out after {timeout}s")
     except (json.JSONDecodeError, KeyError) as e:
         raise ModelError(f"bad response from model: {e}")
     try:

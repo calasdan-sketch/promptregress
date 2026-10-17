@@ -20,7 +20,24 @@ from . import asserts as asserts_mod
 from . import model as model_mod
 from . import suite as suite_mod
 
-CACHE_DIR = ".promptregress/cache"
+CACHE_ROOT = ".promptregress"
+CACHE_DIR = CACHE_ROOT + "/cache"
+# Dropped into .promptregress/ so model outputs never land in a commit;
+# the file ignores everything beside itself.
+CACHE_GITIGNORE = ("# promptregress response cache: safe to delete, "
+                   "never commit\n*\n!.gitignore\n")
+
+
+def ensure_cache_ignored(root: str) -> bool:
+    """Create .promptregress/.gitignore if missing. True when written."""
+    d = os.path.join(root, CACHE_ROOT)
+    p = os.path.join(d, ".gitignore")
+    if os.path.exists(p):
+        return False
+    os.makedirs(d, exist_ok=True)
+    with open(p, "w", encoding="utf-8", newline="\n") as f:
+        f.write(CACHE_GITIGNORE)
+    return True
 
 
 @dataclasses.dataclass
@@ -68,6 +85,7 @@ def _cache_get(root: str, key: str) -> str | None:
 def _cache_put(root: str, key: str, output: str) -> None:
     p = _cache_path(root, key)
     os.makedirs(os.path.dirname(p), exist_ok=True)
+    ensure_cache_ignored(root)
     with open(p, "w", encoding="utf-8") as f:
         json.dump({"output": output}, f)
 
@@ -108,6 +126,7 @@ def _judge_cache_put(root: str, key: str, passed: bool,
                      detail: str) -> None:
     p = _cache_path(root, key)
     os.makedirs(os.path.dirname(p), exist_ok=True)
+    ensure_cache_ignored(root)
     with open(p, "w", encoding="utf-8") as f:
         json.dump({"passed": passed, "detail": detail}, f)
 
