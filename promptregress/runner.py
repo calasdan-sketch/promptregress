@@ -95,9 +95,8 @@ def _cache_write(root: str, key: str, payload: dict) -> None:
 
 def _provider(model_kw: dict) -> tuple[str, str]:
     """(model, base_url) actually used for model_kw, env defaults applied."""
-    cfg = model_mod._cfg(model_kw.get("base_url"), None,
-                         model_kw.get("model"))
-    return cfg["model"], cfg["base_url"]
+    return model_mod.endpoint(model_kw.get("base_url"),
+                              model_kw.get("model"))
 
 
 def _judge_key(prompt_name: str, version: str, case_name: str,
@@ -137,7 +136,15 @@ def run_case(root: str, prompt_name: str, version: str, prompt_text: str,
 
     results: list[AssertionResult] = []
     for assertion in case["assert"]:
-        if isinstance(assertion, dict) and "judge" in assertion:
+        try:
+            assertion = asserts_mod.check(assertion)
+        except ValueError as e:
+            # load_cases refuses such a case; one built by hand (the API) is
+            # reported here as a failed assertion instead of crashing the run
+            results.append(AssertionResult(assertion, False,
+                                           f"bad assertion: {e}"))
+            continue
+        if "judge" in assertion:
             spec = assertion["judge"]
             rubric = spec["rubric"] if isinstance(spec, dict) else spec
             jkey = _judge_key(prompt_name, version, case["name"],

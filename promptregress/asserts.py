@@ -7,57 +7,153 @@ Supported assertions (each is a one-key dict in the case's `assert` list):
   regex: pattern           re.search finds pattern
   not_regex: pattern        re.search finds nothing
   starts_with: str / ends_with: str
-  json_valid: true         output parses as JSON
+  json_valid: true         output parses as JSON (false: it does NOT)
   schema: {...}            parsed JSON validates (mini validator below)
   max_tokens: n / min_tokens: n   ~chars/4 token estimate (documented)
 
 Each returns (passed: bool, detail: str). A malformed assertion (unknown
 kind, YAML null/bool where text is needed, a non-integer token count, an
-invalid regex) raises ValueError with a message the runner shows as
-"bad assertion: ..." — never a TypeError or re.error traceback.
+invalid regex, a schema the validator cannot enforce) raises ValueError
+with a message the runner shows as "bad assertion: ..." — never a TypeError
+or re.error traceback.
+
+A plain number given as text is the text it was written as: `contains: 3.10`
+looks for "3.10", `starts_with: 007` for "007" (see miniyaml.scalar_text).
+
+check() holds an assertion to all of those rules and returns it in working
+form (text as text, counts as ints). The cases loader runs it on every
+assertion of a file, so a bad one is a configuration error before any model
+is called; evaluate() runs it again, so a case built by hand gets the same
+verdict.
 """
 
 from __future__ import annotations
 
+import difflib
 import json
 import re
+
+from . import miniyaml
 
 
 def estimate_tokens(text: str) -> int:
     """Rough token estimate: ~4 chars per token. Documented as approximate;
-    use only for guardrail assertions, never billing."""
+    use only for guardrail assertions, never billing. An empty or blank text
+    is no tokens at all (it used to count as one, so `min_tokens: 1` passed
+    an empty reply)."""
+    if not text.strip():
+        return 0
     return max(1, len(text) // 4)
 
 
-def _check_schema(data, schema: dict, path: str = "$") -> list[str]:
-    """Minimal JSON-schema validator. Returns list of error strings."""
-    errors: list[str] = []
+#: The JSON types the schema validator knows, and the Python-flavoured names
+#: people write instead of them (for the hint in the error).
+SCHEMA_TYPES = ("object", "array", "string", "number", "integer", "boolean",
+                "null")
+_TYPE_HINTS = {"str": "string", "text": "string", "int": "integer",
+               "bool": "boolean", "float": "number", "double": "number",
+               "dict": "object", "map": "object", "list": "array",
+               "none": "null", "nil": "null"}
+#: What the validator enforces. Any other keyword would pass every reply, so
+#: it is an error (check_schema), except these notes that say nothing a
+#: reply could break.
+SCHEMA_KEYWORDS = ("type", "enum", "required", "properties", "items")
+_SCHEMA_NOTES = ("title", "description", "$schema", "$id", "$comment",
+                 "default", "examples")
+
+_TYPE_TESTS = {
+    "object": lambda v: isinstance(v, dict),
+    "array": lambda v: isinstance(v, list),
+    "string": lambda v: isinstance(v, str),
+    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "boolean": lambda v: isinstance(v, bool),
+    "null": lambda v: v is None,
+}
+
+
+def describe(value) -> str:
+    """A value as a message names it: text in quotes, null as null, anything
+    else by its type."""
+    if isinstance(value, str):
+        shown = repr(value)
+        return shown if len(shown) <= 60 else shown[:57] + "..."
+    return "null" if value is None else type(value).__name__
+
+
+def check_schema(schema, path: str = "schema") -> None:
+    """ValueError unless `schema` is one the validator can enforce. It checks
+    type (one name or a list of them), enum, required, properties and items;
+    a keyword beyond those (minimum, pattern, additionalProperties ...) would
+    quietly pass every reply, so it is refused, as is a type it does not
+    know (`str`, `int`: JSON says string, integer)."""
     if not isinstance(schema, dict):
-        return [f"{path}: schema must be an object"]
-    stype = schema.get("type")
-    if stype:
-        ok = {
-            "object": lambda v: isinstance(v, dict),
-            "array": lambda v: isinstance(v, list),
-            "string": lambda v: isinstance(v, str),
-            "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
-            "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
-            "boolean": lambda v: isinstance(v, bool),
-            "null": lambda v: v is None,
-        }.get(stype, lambda v: True)(data)
-        if not ok:
-            errors.append(f"{path}: expected {stype}, got {type(data).__name__}")
+        raise ValueError(f"{path}: must be a mapping, got {describe(schema)}")
+    for key in schema:
+        if key not in SCHEMA_KEYWORDS and key not in _SCHEMA_NOTES:
+            raise ValueError(
+                f"{path}: '{key}' is not supported - this validator checks "
+                f"{', '.join(SCHEMA_KEYWORDS)} and would pass every reply "
+                f"whatever '{key}' says, so it is refused instead of "
+                f"ignored (annotations such as title and description are "
+                f"fine)")
+    if "type" in schema:
+        names = schema["type"]
+        if isinstance(names, list):
+            if not names:
+                raise ValueError(f"{path}.type: needs at least one type")
+        else:
+            names = [names]
+        for name in names:
+            if not isinstance(name, str) or name not in SCHEMA_TYPES:
+                hint = _TYPE_HINTS.get(name.lower()) \
+                    if isinstance(name, str) else None
+                raise ValueError(
+                    f"{path}.type: unknown type {name!r} (use one of "
+                    f"{', '.join(SCHEMA_TYPES)})"
+                    + (f" - did you mean '{hint}'?" if hint else ""))
+    if "enum" in schema and not isinstance(schema["enum"], list):
+        raise ValueError(f"{path}.enum: must be a list, got "
+                         f"{describe(schema['enum'])}")
+    if "required" in schema:
+        required = schema["required"]
+        if not isinstance(required, list) or not all(
+                isinstance(r, str) for r in required):
+            raise ValueError(f"{path}.required: must be a list of key names "
+                             f"(quote a name that looks like a number)")
+    if "properties" in schema:
+        props = schema["properties"]
+        if not isinstance(props, dict):
+            raise ValueError(f"{path}.properties: must be a mapping of key "
+                             f"to schema, got {describe(props)}")
+        for key, sub in props.items():
+            check_schema(sub, f"{path}.properties.{key}")
+    if "items" in schema:
+        check_schema(schema["items"], f"{path}.items")
+
+
+def _check_schema(data, schema: dict, path: str = "$") -> list[str]:
+    """Minimal JSON-schema validator (see check_schema for what it checks).
+    Returns list of error strings. required / properties apply to any object
+    and items to any array, whether or not `type` is given beside them."""
+    errors: list[str] = []
+    names = schema.get("type")
+    if names:
+        names = names if isinstance(names, list) else [names]
+        if not any(_TYPE_TESTS[n](data) for n in names):
+            errors.append(f"{path}: expected {' or '.join(names)}, "
+                          f"got {type(data).__name__}")
             return errors
     if "enum" in schema and data not in schema["enum"]:
         errors.append(f"{path}: {data!r} not in enum {schema['enum']}")
-    if stype == "object" and isinstance(data, dict):
+    if isinstance(data, dict):
         for req in schema.get("required", []):
             if req not in data:
                 errors.append(f"{path}: missing required key {req!r}")
         for key, subschema in schema.get("properties", {}).items():
             if key in data:
                 errors.extend(_check_schema(data[key], subschema, f"{path}.{key}"))
-    if stype == "array" and isinstance(data, list) and "items" in schema:
+    if isinstance(data, list) and "items" in schema:
         for i, item in enumerate(data):
             errors.extend(_check_schema(item, schema["items"], f"{path}[{i}]"))
     return errors
@@ -66,59 +162,144 @@ def _check_schema(data, schema: dict, path: str = "$") -> list[str]:
 TEXT_KINDS = ("contains", "not_contains", "regex", "not_regex",
               "starts_with", "ends_with")
 COUNT_KINDS = ("max_tokens", "min_tokens")
+#: Every assertion name. `judge` is put to a model by the runner; evaluate()
+#: decides all the others itself.
+KINDS = TEXT_KINDS + ("json_valid", "schema") + COUNT_KINDS + ("judge",)
+
+
+def as_text(value, where: str) -> str:
+    """`value` as the text it stands for, or ValueError naming `where` (the
+    key it came from). YAML turns `contains: 1` into an int - fine, that is
+    the text "1", as written - but `contains: yes` into a boolean and
+    `contains: ~` into null: those are almost never what was meant, so say so
+    instead of searching for "True"."""
+    text = miniyaml.scalar_text(value)
+    if text is not None:
+        return text           # a number is the text it was written as
+    if isinstance(value, bool):
+        raise ValueError(
+            f"{where}: {value!r} is a YAML boolean (yes/no/true/false/on/off)"
+            f" - quote the text you mean, e.g. {where}: \"yes\"")
+    if value is None:
+        raise ValueError(f"{where}: needs text, got null (empty or ~) - "
+                         f"quote it, e.g. {where}: \"~\"")
+    raise ValueError(f"{where}: needs text, got {type(value).__name__} "
+                     f"{value!r}")
 
 
 def _text(kind: str, want) -> str:
-    """The text operand of a string assertion. YAML turns `contains: 1`
-    into an int (fine: "1"), but `contains: yes` into a bool and
-    `contains: ~` into null — those are almost never what was meant, so
-    say so instead of searching for "True"."""
-    if isinstance(want, str):
-        return want
-    if isinstance(want, (int, float)) and not isinstance(want, bool):
-        return str(want)
-    if isinstance(want, bool):
+    """The text operand of a string assertion. Empty text is in every reply,
+    so `contains: ""` would pass them all (and `not_contains: ""` fail them
+    all): that is a mistake, not a test."""
+    text = as_text(want, kind)
+    if not text:
         raise ValueError(
-            f"{kind}: {want!r} is a YAML boolean (yes/no/true/false/on/off) "
-            f"— quote the text you mean, e.g. {kind}: \"yes\"")
-    if want is None:
-        raise ValueError(f"{kind}: needs text, got null (empty or ~) — "
-                         f"quote it, e.g. {kind}: \"~\"")
-    raise ValueError(f"{kind}: needs text, got {type(want).__name__} {want!r}")
+            f"{kind}: is empty, so it would "
+            + ("fail every reply - write the text that must not appear"
+               if kind in ("not_contains", "not_regex") else
+               "match every reply - write the text to look for"))
+    return text
+
+
+def _flag(kind: str, want) -> bool:
+    """The true / false operand of json_valid."""
+    if isinstance(want, bool):
+        return want
+    raise ValueError(f"{kind}: needs true or false, got {want!r}")
 
 
 def _count(kind: str, want) -> int:
-    """The integer operand of a token-count assertion ("10" -> 10)."""
+    """The whole-number operand of a token-count assertion ("10" -> 10)."""
+    number = None
     if isinstance(want, bool) or want is None:
-        raise ValueError(f"{kind}: needs a whole number, got {want!r}")
-    if isinstance(want, int):
-        return want
-    if isinstance(want, float) and want.is_integer():
-        return int(want)
-    if isinstance(want, str):
-        try:
-            return int(want.strip())
-        except ValueError:
-            pass
-    raise ValueError(f"{kind}: needs a whole number, got {want!r}")
+        pass
+    elif isinstance(want, int):
+        number = int(want)
+    elif isinstance(want, float) and want.is_integer():
+        number = int(want)
+    elif isinstance(want, str) and re.fullmatch(r"[0-9]+", want.strip()):
+        number = int(want.strip())
+    if number is None or number < 0:
+        raise ValueError(f"{kind}: needs a whole number (0 or more), "
+                         f"got {want!r}")
+    return number
 
 
 def _pattern(kind: str, want) -> re.Pattern:
     text = _text(kind, want)
     try:
         return re.compile(text)
-    except re.error as e:
+    except (re.error, RecursionError, OverflowError) as e:
         raise ValueError(f"{kind}: invalid regex /{text}/: {e}")
 
 
+def _rubric(value, where: str) -> str:
+    if value is None:
+        raise ValueError(f"{where}: needs a rubric, got nothing - say what "
+                         f"the output must be to pass")
+    text = as_text(value, where)
+    if not text.strip():
+        raise ValueError(f"{where}: is empty - say what the output must be "
+                         f"to pass")
+    return text
+
+
+def _judge(want):
+    """The operand of a judge: the rubric as text, or {rubric: text}."""
+    if not isinstance(want, dict):
+        return _rubric(want, "judge")
+    if "rubric" not in want:
+        found = ", ".join(repr(str(k)) for k in want) or "nothing"
+        raise ValueError(f"judge: needs a 'rubric' (found only {found}) - "
+                         f"write `judge: text`, or `rubric: text` under "
+                         f"`judge:`")
+    extra = [str(k) for k in want if k != "rubric"]
+    if extra:
+        raise ValueError(f"judge: unknown key {extra[0]!r} - a judge takes "
+                         f"only 'rubric'")
+    return {"rubric": _rubric(want["rubric"], "judge.rubric")}
+
+
+def check(assertion) -> dict:
+    """The assertion in working form - a text operand as text, a count as an
+    int, a judge's rubric as text - or ValueError saying what is wrong with
+    it (the key is named, the case and file are the caller's to add). Running
+    it on its own result changes nothing."""
+    if not isinstance(assertion, dict):
+        raise ValueError(f"must be a mapping like `contains: text`, got "
+                         f"{describe(assertion)}")
+    if len(assertion) != 1:
+        found = ", ".join(str(k) for k in assertion)
+        raise ValueError(
+            "is empty - write one `kind: value` pair" if not assertion else
+            f"must have exactly one key, got {len(assertion)} ({found}) - "
+            f"start a new list item with `- ` for each assertion")
+    ((kind, want),) = assertion.items()
+    if kind not in KINDS:
+        close = difflib.get_close_matches(str(kind), KINDS, n=1)
+        raise ValueError(
+            f"unknown assertion {str(kind)!r}"
+            + (f" (did you mean {close[0]!r}?)" if close else "")
+            + f" - the assertions are {', '.join(KINDS)}")
+    if kind in TEXT_KINDS:
+        text = _text(kind, want)
+        if kind in ("regex", "not_regex"):
+            _pattern(kind, text)         # a pattern that cannot compile
+        return {kind: text}
+    if kind in COUNT_KINDS:
+        return {kind: _count(kind, want)}
+    if kind == "json_valid":
+        return {kind: _flag(kind, want)}
+    if kind == "schema":
+        check_schema(want)
+        return {kind: want}
+    return {kind: _judge(want)}
+
+
 def evaluate(assertion: dict, output: str) -> tuple[bool, str]:
-    if not isinstance(assertion, dict) or len(assertion) != 1:
-        raise ValueError(f"assertion must be a one-key dict, got {assertion!r}")
-    kind, want = next(iter(assertion.items()))
-    if kind in TEXT_KINDS and kind not in ("regex", "not_regex"):
-        want = _text(kind, want)
-    elif kind in COUNT_KINDS:
-        want = _count(kind, want)
+    """Decide one assertion about a reply: (passed, detail). ValueError when
+    the assertion itself cannot be used (see check)."""
+    kind, want = next(iter(check(assertion).items()))
 
     if kind == "contains":
         ok = want in output
@@ -143,15 +324,23 @@ def evaluate(assertion: dict, output: str) -> tuple[bool, str]:
         ok = output.rstrip().endswith(want)
         return ok, "ends correctly" if ok else f"does not end with {want!r}"
     if kind == "json_valid":
+        wanted = _flag(kind, want)
         try:
             json.loads(output)
-            return True, "valid JSON"
-        except json.JSONDecodeError as e:
-            return False, f"invalid JSON: {e}"
+            problem = None
+        except (ValueError, RecursionError) as e:   # nested too deep: no JSON
+            problem = str(e)
+        if wanted:
+            return (True, "valid JSON") if problem is None else \
+                (False, f"invalid JSON: {problem}")
+        return (True, "not JSON, as required") if problem is not None else \
+            (False, "valid JSON, but json_valid: false asks for text that "
+                    "is not")
     if kind == "schema":
+        check_schema(want)
         try:
             data = json.loads(output)
-        except json.JSONDecodeError as e:
+        except (ValueError, RecursionError) as e:
             return False, f"schema check needs JSON, got: {e}"
         errors = _check_schema(data, want)
         return (not errors,
@@ -162,4 +351,5 @@ def evaluate(assertion: dict, output: str) -> tuple[bool, str]:
     if kind == "min_tokens":
         n = estimate_tokens(output)
         return n >= want, f"~{n} tokens (min {want})"
-    raise ValueError(f"unknown assertion: {kind!r}")
+    raise ValueError(f"{kind}: is put to a model by the runner; it is not "
+                     f"decided here")

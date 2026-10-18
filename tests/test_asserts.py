@@ -78,7 +78,9 @@ class TestTokens(unittest.TestCase):
         # documented as ~4 chars per token, not a whitespace count
         self.assertEqual(a.estimate_tokens("x" * 104), 26)
         self.assertEqual(a.estimate_tokens("a b c d e f g h"), 3)
-        self.assertEqual(a.estimate_tokens(""), 1)
+        self.assertEqual(a.estimate_tokens("a"), 1)
+        # an empty (or blank) reply has no tokens: min_tokens: 1 must fail it
+        self.assertEqual(a.estimate_tokens(""), 0)
 
 
 class TestRawYamlScalars(unittest.TestCase):

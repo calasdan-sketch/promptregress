@@ -1,7 +1,6 @@
 """Runner + CLI tests against the fake model server."""
 
 import errno
-import glob
 import io
 import json
 import os
@@ -602,16 +601,19 @@ class TestCLI(unittest.TestCase):
     def test_demo_scaffold_dir_is_removed(self):
         # --demo scaffolded into tempfile.mkdtemp() and never cleaned up:
         # one promptregress-demo-* dir per trial run piled up in /tmp.
-        pattern = os.path.join(tempfile.gettempdir(), "promptregress-demo-*")
-        before = set(glob.glob(pattern))
+        # a private temp dir: another process (a parallel test run, another
+        # promptregress) also creates and removes promptregress-demo-* dirs in
+        # the shared one
+        private = tempfile.mkdtemp()
         tmp = tempfile.mkdtemp()
         os.environ.pop("PROMPTREGRESS_BASE_URL", None)
-        code, out, err = self._run_capture(
-            ["--root", tmp, "--demo", "diff", "v1", "v2",
-             "--prompt", "sentiment"])
+        with mock.patch.object(tempfile, "tempdir", private):
+            code, out, err = self._run_capture(
+                ["--root", tmp, "--demo", "diff", "v1", "v2",
+                 "--prompt", "sentiment"])
         self.assertEqual(code, 0, err)
         self.assertIn("scaffolded example prompts in", err)
-        self.assertEqual(set(glob.glob(pattern)) - before, set())
+        self.assertEqual(os.listdir(private), [])
         scaffolded = err.split("scaffolded example prompts in ", 1)[1]
         scaffolded = scaffolded.split(";", 1)[0]
         self.assertFalse(os.path.exists(scaffolded), scaffolded)
@@ -712,13 +714,17 @@ class TestRound3(unittest.TestCase):
     def test_raw_yaml_scalars_in_assertions_are_bad_assertions(self):
         # `contains: yes` (a YAML bool), `contains: ~` (null) and
         # `max_tokens: "10"` raised TypeError out of the evaluator;
-        # `regex: (` raised re.error. All must be reported per case.
+        # `regex: (` raised re.error. A suite holding such assertions is
+        # now refused when it is loaded - exit 2 with every problem named,
+        # before any model is called - and what YAML hands over unambiguously
+        # (the number 1, the text "10" for a count) still works.
         tmp = tempfile.mkdtemp()
         d = os.path.join(tmp, "prompts")
         os.makedirs(d)
         with open(os.path.join(d, "yn.v1.txt"), "w") as f:
             f.write("Answer: {{input}}")
-        with open(os.path.join(d, "yn.cases.yaml"), "w") as f:
+        cases = os.path.join(d, "yn.cases.yaml")
+        with open(cases, "w") as f:
             f.write("""cases:
   - name: bool
     input: "a"
@@ -728,7 +734,7 @@ class TestRound3(unittest.TestCase):
     input: "b"
     assert:
       - contains: 1
-  - name: null
+  - name: nothing
     input: "c"
     assert:
       - contains: ~
@@ -742,20 +748,33 @@ class TestRound3(unittest.TestCase):
       - regex: (
 """)
         server, url = start_fake_model({}, default="1 yes")
+        argv = ["--root", tmp, "--base-url", url, "run", "--prompt", "yn",
+                "--version", "v1", "--no-cache"]
         try:
-            code, out, err = self._run_capture(
-                ["--root", tmp, "--base-url", url, "run", "--prompt", "yn",
-                 "--version", "v1", "--no-cache"])
+            code, out, err = self._run_capture(argv)
+            self.assertEqual(code, 2)
+            self.assertNotIn("Traceback", err)
+            self.assertEqual(out, "")          # nothing was judged
+            self.assertIn("case 0 ('bool'): assert[0]: contains: True is a "
+                          "YAML boolean", err)
+            self.assertIn('quote the text you mean, e.g. contains: "yes"',
+                          err)
+            self.assertIn("case 2 ('nothing'): assert[0]: contains: needs "
+                          "text, got null", err)
+            self.assertIn("case 4 ('bad-regex'): assert[0]: regex: invalid "
+                          "regex /(/", err)
+            self.assertNotIn("case 1", err)    # the number 1 is the text "1"
+            self.assertNotIn("case 3", err)    # "10" is a fine count
+            with open(cases, "w") as f:
+                f.write("cases:\n  - name: int\n    input: b\n    assert:\n"
+                        "      - contains: 1\n  - name: quoted-count\n"
+                        "    input: d\n    assert:\n"
+                        "      - max_tokens: \"10\"\n")
+            code, out, err = self._run_capture(argv)
         finally:
             server.shutdown()
-        self.assertEqual(code, 1)
-        self.assertNotIn("Traceback", err)
-        self.assertIn("yn.v1: F.F.F", out)
-        self.assertIn("bad assertion: contains: True is a YAML boolean", out)
-        self.assertIn('quote the text you mean, e.g. contains: "yes"', out)
-        self.assertIn("bad assertion: contains: needs text, got null", out)
-        self.assertIn("bad assertion: regex: invalid regex /(/", out)
-        self.assertIn("2/5 passed", out)  # int coerced, "10" coerced
+        self.assertEqual(code, 0, err)
+        self.assertIn("2/2 passed", out)
 
     def test_model_flags_accepted_after_the_subcommand(self):
         # --model/--base-url/--api-key/--demo were top-level only:

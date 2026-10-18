@@ -7,21 +7,31 @@ Layout:
 
 Case YAML:
   cases:
-    - name: short review
+    - name: short review          # optional; case-0, case-1 ... if left out
       input: "This broke after two days."
-      vars: {tone: terse}          # optional extra template vars
+      vars:                       # optional extra template vars: {{tone}}
+        tone: terse
       assert:
         - contains: negative
         - json_valid: true
+
+A case has those four keys and no others (a typo such as `varss:` would
+otherwise be dropped without a word). load_cases() checks the whole file -
+every case, every assertion - and returns the cases in working form: texts
+as text (`input: 3.10` is "3.10"), assertions as asserts.check() has them. A
+file that cannot be used as a suite is a ValueError with one line per
+problem, each naming the file, the case and the key: a configuration error
+(exit 2) before any model is called.
 """
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import os
 import re
 
-from . import miniyaml
+from . import asserts, miniyaml
 
 PROMPTS_DIR = "prompts"
 
@@ -57,13 +67,103 @@ def render(template: str, input_text: str, vars: dict | None = None) -> str:
     return out
 
 
+CASE_KEYS = ("name", "input", "vars", "assert")
+#: At most this many problems are listed, so a file that is wrong everywhere
+#: does not flood a CI log.
+MAX_PROBLEMS = 20
+
+
+def _check_case(case: dict, index: int) -> tuple[dict, str, list[str]]:
+    """(the case in working form, how to name it in a message, its problems).
+    The working form has exactly name, input, vars and assert: every text a
+    str (a number is the text it was written as), every assertion as
+    asserts.check() returns it. A problem is one line that names the key."""
+    problems: list[str] = []
+    for key in case:
+        if key not in CASE_KEYS:
+            close = difflib.get_close_matches(str(key), CASE_KEYS, n=1)
+            problems.append(
+                f"unknown key {str(key)!r}"
+                + (f" (did you mean {close[0]!r}?)" if close else
+                   f" (a case has {', '.join(CASE_KEYS)}; put notes in a "
+                   f"# comment)"))
+    missing = [k for k in ("input", "assert") if k not in case]
+    if missing:
+        problems.append("needs 'input' and 'assert' (no "
+                        + " or ".join(repr(k) for k in missing) + " here)")
+
+    name, label = f"case-{index}", ""
+    if case.get("name") is not None:       # `name:` alone is no name either
+        try:
+            given = asserts.as_text(case["name"], "name")
+        except ValueError as e:
+            problems.append(str(e))
+        else:
+            if given.strip():
+                name, label = given, f" ({given!r})"
+
+    text = ""
+    if "input" in case:
+        if case["input"] is None:
+            problems.append('input: is empty - write input: "" if an empty '
+                            'input is what you mean')
+        else:
+            try:
+                text = asserts.as_text(case["input"], "input")
+            except ValueError as e:
+                problems.append(str(e))
+
+    variables: dict[str, str] = {}
+    declared = case.get("vars")
+    if isinstance(declared, dict):
+        for key, value in declared.items():
+            try:
+                variables[str(key)] = asserts.as_text(value, f"vars.{key}")
+            except ValueError as e:
+                problems.append(str(e))
+    elif declared is not None:
+        problems.append(f"vars: must be a mapping of name to text, got "
+                        f"{asserts.describe(declared)}")
+
+    checked: list[dict] = []
+    if "assert" in case:
+        listed = case["assert"]
+        if listed is None or listed == []:
+            problems.append("assert: has no assertions - a case that checks "
+                            "nothing always passes")
+        elif not isinstance(listed, list):
+            problems.append(f"assert: must be a list of assertions (each one "
+                            f"starts with `- `), got "
+                            f"{asserts.describe(listed)}")
+        else:
+            for j, item in enumerate(listed):
+                try:
+                    checked.append(asserts.check(item))
+                except ValueError as e:
+                    problems.append(f"assert[{j}]: {e}")
+    return ({"name": name, "input": text, "vars": variables,
+             "assert": checked}, label, problems)
+
+
 def load_cases(root: str, name: str,
                prompts_dir: str = PROMPTS_DIR) -> list[dict]:
+    """The cases of prompt `name`, checked and in working form (_check_case).
+
+    FileNotFoundError when there is no cases file. ValueError when the file
+    cannot be used as a suite - malformed YAML, no cases, a case or an
+    assertion that is not one - with one line per problem, each naming the
+    file, the case and the key."""
     path = os.path.join(root, prompts_dir, f"{name}.cases.yaml")
     if not os.path.isfile(path):
         raise FileNotFoundError(f"no cases file: {path}")
-    with open(path, encoding="utf-8") as f:
-        text = f.read()
+    try:
+        # utf-8-sig: a byte-order mark (Notepad's "UTF-8") is not part of
+        # the first key
+        with open(path, encoding="utf-8-sig") as f:
+            text = f.read()
+    except UnicodeDecodeError as e:
+        raise ValueError(f"{path}: not UTF-8 text ({e.reason} at byte "
+                         f"{e.start}) - save the file as UTF-8")
     try:
         data = miniyaml.safe_load(text) or {}
     except ValueError as e:
@@ -71,15 +171,35 @@ def load_cases(root: str, name: str,
     if not isinstance(data, dict):
         raise ValueError(f"{path}: top-level must be a mapping "
                          f"with a 'cases' list")
-    cases = data.get("cases", [])
+    if "cases" not in data:
+        # a typo ("case:", "test:") must not turn into a suite that runs
+        # nothing and passes: say what the file has instead
+        found = ", ".join(repr(str(k)) for k in data) or "nothing"
+        raise ValueError(f"{path}: no 'cases:' list found (the file has "
+                         f"{found}) - it must start with `cases:`")
+    cases = data["cases"]
+    if cases is None or cases == []:
+        raise ValueError(f"{path}: 'cases' has no cases - a suite that "
+                         f"runs nothing would pass, so add at least one")
     if not isinstance(cases, list):
         raise ValueError(f"{path}: 'cases' must be a list")
-    for i, c in enumerate(cases):
-        if not isinstance(c, dict) or "input" not in c or "assert" not in c:
-            raise ValueError(f"{path}: case {i} needs 'input' and 'assert'")
-        c.setdefault("name", f"case-{i}")
-        c.setdefault("vars", {})
-    return cases
+    problems: list[str] = []
+    checked: list[dict] = []
+    for i, raw in enumerate(cases):
+        if not isinstance(raw, dict):
+            problems.append(f"{path}: case {i} needs 'input' and 'assert', "
+                            f"got {asserts.describe(raw)}")
+            continue
+        case, label, found = _check_case(raw, i)
+        checked.append(case)
+        problems.extend(f"{path}: case {i}{label}: {p}" for p in found)
+    if len(problems) > MAX_PROBLEMS:
+        more = len(problems) - MAX_PROBLEMS
+        problems = problems[:MAX_PROBLEMS] + [
+            f"{path}: ... and {more} more problem(s)"]
+    if problems:
+        raise ValueError("\n".join(problems))
+    return checked
 
 
 def cache_key(name: str, version: str, prompt_text: str,

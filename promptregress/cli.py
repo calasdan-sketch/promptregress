@@ -11,6 +11,13 @@ diff versions A/B, and catch prompt drift before your users do.
 
 (--demo trials the suite against a built-in fake model; after
 `pip install .` the `promptregress` command is on your PATH.)
+
+Exit status: 0 every case passed (or the command is done); 1 a case failed;
+2 usage or configuration error, nothing was judged: a prompt or cases file
+that is missing or unusable (no cases, an assertion that does not exist ...),
+an API key that cannot be sent, a model that cannot be used. `diff` only
+reports: it exits 0 whenever the comparison was made, whether or not verdicts
+flipped (a flip can be a fix as well as a regression; gate builds with `run`).
 """
 
 from __future__ import annotations
@@ -28,7 +35,7 @@ from . import model as model_mod
 from . import runner as runner_mod
 from . import suite as suite_mod
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 
 def _harden_streams() -> None:
@@ -147,7 +154,8 @@ def _closed_pipe_tolerant():
 
 def _model_kw(args) -> dict:
     kw: dict = {}
-    for name in ("model", "base_url", "api_key", "timeout"):
+    for name in ("model", "base_url", "api_key", "timeout",
+                 "max_reply_bytes"):
         val = getattr(args, name, None)
         if val is not None:
             kw[name] = val
@@ -241,14 +249,19 @@ def cmd_list(args) -> int:
     if not prompts:
         print("no prompts found — run `promptregress init`")
         return 0
+    problems = []
     for name, versions in prompts.items():
         try:
-            n_cases = len(suite_mod.load_cases(args.root, name))
+            shown = f"{len(suite_mod.load_cases(args.root, name))} cases"
         except FileNotFoundError:
-            n_cases = 0
-        print(f"{name}: versions {', '.join(versions)} "
-              f"({n_cases} cases)")
-    return 0
+            shown = "0 cases"
+        except ValueError as e:
+            shown = "invalid cases file"
+            problems.append(str(e))
+        print(f"{name}: versions {', '.join(versions)} ({shown})")
+    for problem in problems:
+        print(f"error: {problem}", file=sys.stderr)
+    return 2 if problems else 0
 
 
 def _suite_dict(name: str, version: str,
@@ -302,12 +315,28 @@ def _first_error(*result_lists) -> str:
     return ""
 
 
-def _run_or_error(root, name, version, args):
+def _load_suites(root: str, names) -> dict | None:
+    """name -> cases for each prompt in `names`, or None after printing every
+    problem found. All of it is read before the first model call: a suite
+    that cannot be used is reported at once, not after the suites before it
+    were run (and paid for)."""
+    loaded: dict[str, list] = {}
+    usable = True
+    for name in dict.fromkeys(names):
+        try:
+            loaded[name] = suite_mod.load_cases(root, name)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            usable = False
+    return loaded if usable else None
+
+
+def _run_or_error(root, name, version, args, cases=None):
     """run_suite with the user-facing error contract: returns
     (results, None) or (None, exit code) after printing the error."""
     try:
         results, _ = runner_mod.run_suite(
-            root, name, version, model_kw=_model_kw(args),
+            root, name, version, cases=cases, model_kw=_model_kw(args),
             use_cache=_use_cache(args))
     except (FileNotFoundError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
@@ -336,9 +365,12 @@ def cmd_run(args) -> int:
             return 2
     else:
         targets = [(args.prompt, args.version)]
+    cases = _load_suites(root, [name for name, _ in targets])
+    if cases is None:
+        return 2
     suites = []
     for name, version in targets:
-        results, rc = _run_or_error(root, name, version, args)
+        results, rc = _run_or_error(root, name, version, args, cases[name])
         if results is None:
             return rc
         suites.append((name, version, results))
@@ -413,11 +445,22 @@ def cmd_diff(args) -> int:
     return 0
 
 
+def _flag(parse):
+    """An argparse `type` from one of model's parse_* functions: a value it
+    refuses is a usage error that says why."""
+    def convert(text):
+        try:
+            return parse(text)
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(str(e))
+    return convert
+
+
 def _add_model_options(p: argparse.ArgumentParser, *, on_subcommand: bool) -> None:
-    """--model/--base-url/--api-key/--timeout/--demo, accepted both before
-    and after the subcommand. On the subcommand the defaults are
-    SUPPRESS, so an unset option there keeps the value parsed from the
-    top level instead of clobbering it with None/False."""
+    """--model/--base-url/--api-key/--timeout/--max-reply-bytes/--demo,
+    accepted both before and after the subcommand. On the subcommand the
+    defaults are SUPPRESS, so an unset option there keeps the value parsed
+    from the top level instead of clobbering it with None/False."""
     d = argparse.SUPPRESS if on_subcommand else None
     p.add_argument("--model", default=d, help="Model name (env PROMPTREGRESS_MODEL).")
     p.add_argument("--base-url", default=d,
@@ -426,10 +469,20 @@ def _add_model_options(p: argparse.ArgumentParser, *, on_subcommand: bool) -> No
                    help="API key (env PROMPTREGRESS_API_KEY is safer: a key "
                         "on the command line is visible to other users "
                         "via `ps` and shell history).")
-    p.add_argument("--timeout", type=float, default=d,
-                   help=f"Seconds per model request (default "
-                        f"{model_mod.DEFAULT_TIMEOUT:g}; env PROMPTREGRESS_TIMEOUT). "
-                        f"The first case the model cannot answer stops the run.")
+    p.add_argument("--timeout", type=_flag(model_mod.parse_seconds),
+                   default=d, metavar="SECONDS",
+                   help=f"Seconds for one model request, from connecting to "
+                        f"the last byte of the reply: a deadline, not a "
+                        f"limit per read (default "
+                        f"{model_mod.DEFAULT_TIMEOUT:g}; env "
+                        f"PROMPTREGRESS_TIMEOUT). The first case the model "
+                        f"cannot answer stops the run.")
+    p.add_argument("--max-reply-bytes", type=_flag(model_mod.parse_byte_limit),
+                   default=d, metavar="N",
+                   help=f"Largest reply body accepted, in bytes (default "
+                        f"{model_mod.DEFAULT_MAX_REPLY_BYTES}, 8 MiB; env "
+                        f"PROMPTREGRESS_MAX_REPLY_BYTES). A bigger reply is "
+                        f"an error; it is never read into memory.")
     p.add_argument("--demo", action="store_true",
                    default=argparse.SUPPRESS if on_subcommand else False,
                    help="Trial mode: run against the built-in in-process "
@@ -460,7 +513,16 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--format", choices=["human", "json"], default="human")
     _add_model_options(r, on_subcommand=True)
 
-    d = sub.add_parser("diff", help="A/B two versions on the same cases.")
+    d = sub.add_parser(
+        "diff", help="A/B two versions on the same cases (exits 0 even when "
+                     "verdicts flip: gate builds with `run`).",
+        description="Run both versions on the same cases and show which cases "
+                    "change verdict. Exit status: 0 whenever the comparison "
+                    "was made, flipped verdicts included - a flip can be a "
+                    "fix as well as a regression, so diff reports and does "
+                    "not judge; gate a build with `run`. 2 when the "
+                    "comparison could not be made (a missing or unusable "
+                    "file, a model that cannot answer).")
     d.add_argument("v1")
     d.add_argument("v2")
     d.add_argument("--prompt", required=True)
@@ -484,6 +546,7 @@ def main(argv=None) -> int:
             # A PROMPTREGRESS_BASE_URL left in the environment (or a
             # --base-url) used to win silently and hit a real server.
             demo_server, url = demo_mod.start_demo_model()
+            stack.callback(demo_server.server_close)   # runs after shutdown
             stack.callback(demo_server.shutdown)
             ignored = [f"--base-url {args.base_url}"] if args.base_url else []
             if os.environ.get("PROMPTREGRESS_BASE_URL"):
@@ -493,6 +556,25 @@ def main(argv=None) -> int:
                 print("(demo: using the built-in fake model; ignoring "
                       f"{', '.join(ignored)})", file=sys.stderr)
             args.base_url = url
+            # the fake model has no use for a key, and one left in the real
+            # environment (even a broken one) is none of its business; nor
+            # are the limits the environment sets
+            args.api_key = "demo"
+            if args.timeout is None:
+                args.timeout = model_mod.DEFAULT_TIMEOUT
+            if args.max_reply_bytes is None:
+                args.max_reply_bytes = model_mod.DEFAULT_MAX_REPLY_BYTES
+        elif args.cmd in ("run", "diff"):
+            # a key that cannot be sent, a limit that is not a number: a
+            # configuration error. Say so before the first request, whether
+            # or not the cache could have answered
+            try:
+                model_mod.check_key(model_mod.resolve_api_key(args.api_key))
+                model_mod.resolve_timeout(args.timeout)
+                model_mod.resolve_max_reply_bytes(args.max_reply_bytes)
+            except model_mod.ModelError as e:
+                print(f"error: {e}", file=sys.stderr)
+                return 2
         return {"init": cmd_init, "list": cmd_list,
                 "run": cmd_run, "diff": cmd_diff}[args.cmd](args)
 

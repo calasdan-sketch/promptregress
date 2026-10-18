@@ -9,8 +9,11 @@ Handles the subset these tools need:
   - scalars: quoted strings (double quotes take the JSON escapes:
     backslash-n, backslash-t, escaped quote and backslash, backslash-uXXXX;
     single quotes are literal, except that a doubled '' is one '),
-    ints, floats, bools, null
-  - "#" comments (outside quotes)
+    ints, floats (ASCII decimal forms; a number remembers the text it was
+    written as, see scalar_text), bools, null
+  - "#" comments: a "#" that starts a line or follows whitespace, outside
+    quotes. A quote only opens a quoted string at the START of a scalar, so
+    the apostrophe in `It's fine   # TODO` does not hide the comment
 
 NOT supported (raises ValueError): anchors, aliases, tags, block-scalar
 indentation indicators ("|2"), flow maps, duplicate keys. Configs using them get a
@@ -36,6 +39,13 @@ _BLOCK_RE = re.compile(r"^(- +(?:[A-Za-z0-9_.\-/ ]+: +)?|[A-Za-z0-9_.\-/ ]+: +)"
                        r"([|>])([-+0-9]*)$")
 _BLOCK_TAG = "\x00block:"
 
+# YAML's core schema: ASCII decimal digits only. Python's int() and float()
+# also take "1_000", "nan", "Infinity" and the digits of other scripts, which
+# are words, not numbers.
+_INT_RE = re.compile(r"[-+]?[0-9]+")
+_FLOAT_RE = re.compile(r"[-+]?(?:[0-9]+\.[0-9]*|\.[0-9]+|[0-9]+(?=[eE]))"
+                       r"(?:[eE][-+]?[0-9]+)?")
+
 #: Deepest block-nesting level accepted. Deeper input raises ValueError
 #: (the parser's error contract) instead of RecursionError.
 MAX_DEPTH = 50
@@ -45,21 +55,118 @@ def _err(msg: str, lineno: int) -> ValueError:
     return ValueError(f"miniyaml: {msg} (line {lineno})")
 
 
+# What leads a line's scalar: indentation, one "- ", one "key: ".
+_LEAD_RE = re.compile(r"[ \t]*(?:-(?:[ \t]+|$))?"
+                      r"(?:[A-Za-z0-9_.\-/ ]+:(?:[ \t]+|$))?")
+
+
+def _quoted_end(s: str, i: int) -> int | None:
+    """Index just past the quoted string that opens at s[i], or None when it
+    never closes. Double quotes take backslash escapes; in single quotes a
+    doubled '' is an apostrophe, not the end."""
+    quote, n = s[i], len(s)
+    i += 1
+    while i < n:
+        ch = s[i]
+        if quote == '"' and ch == "\\":
+            i += 2
+        elif ch != quote:
+            i += 1
+        elif quote == "'" and s[i + 1:i + 2] == "'":
+            i += 2
+        else:
+            return i + 1
+    return None
+
+
+def _flow_end(s: str, i: int) -> int:
+    """Index just past the flow list that opens at s[i]: len(s) when it never
+    closes, the index of a comment's "#" when one cuts it short. Inside it a
+    quote only opens a quoted item at the start of an item."""
+    n = len(s)
+    i += 1
+    at_item_start = True
+    while i < n:
+        ch = s[i]
+        if ch in " \t":
+            i += 1
+            continue
+        if ch == "#" and s[i - 1] in " \t":
+            return i
+        if at_item_start and ch in ("'", '"'):
+            end = _quoted_end(s, i)
+            if end is None:
+                return n
+            i, at_item_start = end, False
+            continue
+        if ch == "]":
+            return i + 1
+        at_item_start = ch == ","
+        i += 1
+    return n
+
+
 def _strip_comment(line: str) -> str:
-    in_s = in_d = False
-    for i, ch in enumerate(line):
-        if ch == "'" and not in_d:
-            in_s = not in_s
-        elif ch == '"' and not in_s:
-            in_d = not in_d
-        elif ch == "#" and not in_s and not in_d:
-            if i == 0 or line[i - 1] in " \t":
-                return line[:i]
-    return line
+    """The line without its trailing comment: a "#" that starts the line or
+    follows whitespace, outside a quoted string. In YAML a quote only opens a
+    quoted string at the start of a scalar -- the apostrophe in `It's fine
+    # TODO` and in `5 o'clock` is a character like any other -- so a line is
+    read as what leads it (indent, "- ", "key:") and then one scalar: quoted,
+    a flow list, or plain text."""
+    i = _LEAD_RE.match(line).end()
+    first = line[i:i + 1]
+    if first in ("'", '"'):
+        i = _quoted_end(line, i)
+        if i is None:
+            return line          # unterminated: the value check says so
+    elif first == "[":
+        i = _flow_end(line, i)
+    while True:
+        j = line.find("#", i)
+        if j < 0:
+            return line
+        if j == 0 or line[j - 1] in " \t":
+            return line[:j]
+        i = j + 1
+
+
+class _RawInt(int):
+    """An int that remembers the text it was written as ("007", "+5")."""
+    raw = ""
+
+
+class _RawFloat(float):
+    """A float that remembers the text it was written as ("3.10", "1e5")."""
+    raw = ""
+
+
+def scalar_text(value) -> str | None:
+    """The text a scalar was written as, for the places that need text: what
+    a plain number looked like in the file, not what Python prints for it
+    (3.10 -> "3.10", not "3.1"; 007 -> "007"). None for anything that is
+    neither text nor a number: a boolean, null, a list, a mapping."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (_RawInt, _RawFloat)):
+        return value.raw
+    if isinstance(value, (str, int, float)):
+        return str(value)
+    return None
+
+
+class _Block:
+    """Stands for the n-th block scalar until the whole text is parsed. A
+    class of our own: no text in the file can be mistaken for it (a quoted
+    "\u0000block:0" decodes to the same characters as the placeholder)."""
+
+    def __init__(self, index: int):
+        self.index = index
 
 
 def _scalar(s: str):
     s = s.strip()
+    if s.startswith(_BLOCK_TAG):      # our own placeholder (see safe_load)
+        return _Block(int(s[len(_BLOCK_TAG):]))
     if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
         inner = s[1:-1]
         if s[0] == '"':
@@ -81,14 +188,17 @@ def _scalar(s: str):
         return True
     if low in ("false", "no", "off"):
         return False
-    try:
-        return int(s)
-    except ValueError:
-        pass
-    try:
-        return float(s)
-    except ValueError:
-        pass
+    if _INT_RE.fullmatch(s):
+        try:
+            number = _RawInt(int(s))
+        except ValueError:            # more digits than int() will take
+            return s
+        number.raw = s
+        return number
+    if _FLOAT_RE.fullmatch(s):
+        number = _RawFloat(float(s))
+        number.raw = s
+        return number
     return s
 
 
@@ -155,22 +265,22 @@ def _flow_list(s: str, lineno: int) -> list:
     inner = s.strip()[1:-1].strip()
     if not inner:
         return []
-    raw_items, cur, in_s, in_d = [], "", False, False
-    for ch in inner:
-        if ch == "'" and not in_d:
-            in_s = not in_s
-            cur += ch
-        elif ch == '"' and not in_s:
-            in_d = not in_d
-            cur += ch
-        elif ch == "," and not in_s and not in_d:
-            raw_items.append(cur)
-            cur = ""
-        else:
-            cur += ch
-    if in_s or in_d:
-        raise _err(f"unterminated quote in flow list: {s}", lineno)
-    raw_items.append(cur)
+    # a quote opens a quoted item only at the start of an item
+    raw_items, start = [], 0
+    while True:
+        i = start
+        while i < len(inner) and inner[i] in " \t":
+            i += 1
+        if inner[i:i + 1] in ("'", '"'):
+            i = _quoted_end(inner, i)
+            if i is None:
+                raise _err(f"unterminated quote in flow list: {s}", lineno)
+        comma = inner.find(",", i)
+        if comma < 0:
+            raw_items.append(inner[start:])
+            break
+        raw_items.append(inner[start:comma])
+        start = comma + 1
     out = []
     for item in raw_items:
         _check_value(item, lineno, in_flow=True)
@@ -236,8 +346,8 @@ def _resolve(obj, blocks):
         return {k: _resolve(v, blocks) for k, v in obj.items()}
     if isinstance(obj, list):
         return [_resolve(v, blocks) for v in obj]
-    if isinstance(obj, str) and obj.startswith(_BLOCK_TAG):
-        return blocks[int(obj[len(_BLOCK_TAG):])]
+    if isinstance(obj, _Block):
+        return blocks[obj.index]
     return obj
 
 
@@ -245,6 +355,10 @@ def safe_load(text: str):
     # items: (line number, indent, content)
     items, blocks = [], []
     raw_lines = text.splitlines()
+    # the placeholder for a block scalar contains a NUL; none may be in the text
+    for n, ln in enumerate(raw_lines, 1):
+        if "\x00" in ln:
+            raise _err("NUL characters are not allowed", n)
     i = 0
     while i < len(raw_lines):
         raw = raw_lines[i]
