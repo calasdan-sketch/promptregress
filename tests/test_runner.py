@@ -27,6 +27,13 @@ from promptregress import suite as suite_mod
 from promptregress.demo import start_fake_model
 
 
+def stop_server(server):
+    """Stop a fake server and release its listening socket: shutdown() ends
+    serve_forever(), only server_close() closes the socket."""
+    server.shutdown()
+    server.server_close()
+
+
 def start_error_server(status: int, body: str):
     """An endpoint that answers every POST with `status` and `body`."""
     class H(BaseHTTPRequestHandler):
@@ -89,7 +96,7 @@ class TestModel(unittest.TestCase):
                                      api_key="x", model="fake")
             self.assertEqual(out, "world")
         finally:
-            server.shutdown()
+            stop_server(server)
 
     def test_unreachable(self):
         with self.assertRaises(model_mod.ModelError):
@@ -107,7 +114,7 @@ class TestModel(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("FAIL", detail)
         finally:
-            server.shutdown()
+            stop_server(server)
 
 
 class TestRunner(unittest.TestCase):
@@ -123,13 +130,13 @@ class TestRunner(unittest.TestCase):
             self.assertTrue(all(r.passed for r in results))
             self.assertFalse(any(r.cached for r in results))
             # second run hits cache — shut the server to prove it
-            server.shutdown()
+            stop_server(server)
             results2, _ = runner_mod.run_suite(tmp, "cls", "v1", model_kw=kw)
             self.assertTrue(all(r.cached for r in results2))
             self.assertTrue(all(r.passed for r in results2))
         finally:
             try:
-                server.shutdown()
+                stop_server(server)
             except Exception:
                 pass
 
@@ -144,7 +151,7 @@ class TestRunner(unittest.TestCase):
             runner_mod.run_suite(tmp, "cls", "v1", model_kw={
                 "base_url": url, "api_key": "x", "model": "fake"})
         finally:
-            server.shutdown()
+            stop_server(server)
         results, _ = runner_mod.run_suite(tmp, "cls", "v1", model_kw={
             "base_url": "http://127.0.0.1:1/v1", "api_key": "x",
             "model": "fake"})
@@ -169,8 +176,8 @@ class TestRunner(unittest.TestCase):
                 judge_model_kw={"base_url": u2, "model": "fake"})
             self.assertFalse(r2.passed)  # judge 2's own verdict
         finally:
-            s1.shutdown()
-            s2.shutdown()
+            stop_server(s1)
+            stop_server(s2)
 
     def test_failure_detail(self):
         tmp = tempfile.mkdtemp()
@@ -182,7 +189,7 @@ class TestRunner(unittest.TestCase):
             self.assertFalse(all(r.passed for r in results))
             self.assertTrue(results[0].assertions)
         finally:
-            server.shutdown()
+            stop_server(server)
 
 
     def test_judge_verdict_cached(self):
@@ -203,7 +210,7 @@ class TestRunner(unittest.TestCase):
                 self.assertTrue(all(r.cached for r in r2))
                 self.assertEqual(spy.call_count, 1)
         finally:
-            server.shutdown()
+            stop_server(server)
 
     def test_judge_cache_files(self):
         # Verdicts land in the existing response-cache dir, namespaced.
@@ -215,7 +222,7 @@ class TestRunner(unittest.TestCase):
         try:
             runner_mod.run_suite(tmp, "cls", "v1", model_kw=kw)
         finally:
-            server.shutdown()
+            stop_server(server)
         cached = os.listdir(os.path.join(tmp, ".promptregress", "cache"))
         judges = [f for f in cached if f.startswith("judge-")]
         self.assertEqual(len(judges), 1)
@@ -290,7 +297,7 @@ class TestCLI(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertIn("2/2 passed", out)
         finally:
-            server.shutdown()
+            stop_server(server)
 
     def test_run_fail(self):
         tmp = tempfile.mkdtemp()
@@ -302,7 +309,7 @@ class TestCLI(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("FAIL neg", out)
         finally:
-            server.shutdown()
+            stop_server(server)
 
     def test_diff(self):
         tmp = tempfile.mkdtemp()
@@ -316,7 +323,7 @@ class TestCLI(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertIn("CHANGED", out)
         finally:
-            server.shutdown()
+            stop_server(server)
 
     def test_diff_json(self):
         tmp = tempfile.mkdtemp()
@@ -330,7 +337,7 @@ class TestCLI(unittest.TestCase):
             self.assertEqual(data["prompt"], "cls")
             self.assertEqual(len(data["cases"]), 2)
         finally:
-            server.shutdown()
+            stop_server(server)
 
     def test_run_json_exit_code(self):
         # --format json must exit nonzero when cases fail (CI honesty).
@@ -345,7 +352,7 @@ class TestCLI(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(out)["failed"], 0)
         finally:
-            server.shutdown()
+            stop_server(server)
         tmp2 = tempfile.mkdtemp()
         make_suite(tmp2)
         server2, url2 = start_fake_model({})
@@ -356,7 +363,7 @@ class TestCLI(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertEqual(json.loads(out)["failed"], 2)
         finally:
-            server2.shutdown()
+            stop_server(server2)
 
     def test_diff_shows_before_after(self):
         tmp = tempfile.mkdtemp()
@@ -371,7 +378,7 @@ class TestCLI(unittest.TestCase):
             self.assertIn("'negative'", out)
             self.assertIn("'positive'", out)
         finally:
-            server.shutdown()
+            stop_server(server)
 
     def test_diff_json_includes_outputs(self):
         tmp = tempfile.mkdtemp()
@@ -390,7 +397,7 @@ class TestCLI(unittest.TestCase):
             self.assertEqual(by_name["neg"]["v1_output"], "negative")
             self.assertEqual(by_name["neg"]["v2_output"], "positive")
         finally:
-            server.shutdown()
+            stop_server(server)
 
     def test_malformed_cases_yaml_cli(self):
         # Clean stderr message + exit 2, no traceback.
@@ -562,7 +569,7 @@ class TestCLI(unittest.TestCase):
             code, out, err401 = self._run_capture(
                 ["--root", tmp, "--base-url", url, *argv])
         finally:
-            server.shutdown()
+            stop_server(server)
         self.assertEqual(code, 2)
         self.assertIn("error: model at http://127.0.0.1:", err401)
         self.assertIn("HTTP 401 Unauthorized: Invalid API key", err401)
@@ -574,7 +581,7 @@ class TestCLI(unittest.TestCase):
             code, out, err404 = self._run_capture(
                 ["--root", tmp, "--base-url", url.replace("/v1", ""), *argv])
         finally:
-            server.shutdown()
+            stop_server(server)
         self.assertEqual(code, 2)
         self.assertIn("HTTP 404 Not Found", err404)
         self.assertNotIn("<html", err404.lower())  # HTML page not dumped
@@ -593,7 +600,7 @@ class TestCLI(unittest.TestCase):
                 ["--root", tmp, "--base-url", url, "diff", "v1", "v2",
                  "--prompt", "sentiment", "--no-cache"])
         finally:
-            server.shutdown()
+            stop_server(server)
         self.assertEqual(code, 2)
         self.assertIn("HTTP 401 Unauthorized: nope", err)
         self.assertNotIn("CHANGED", out)
@@ -646,7 +653,7 @@ class TestCLI(unittest.TestCase):
             runner_mod.run_suite(tmp2, "cls", "v1", model_kw={
                 "base_url": url, "api_key": "x", "model": "fake"})
         finally:
-            server.shutdown()
+            stop_server(server)
         self.assertTrue(os.path.isfile(
             os.path.join(tmp2, ".promptregress", ".gitignore")))
 
@@ -772,7 +779,7 @@ class TestRound3(unittest.TestCase):
                         "      - max_tokens: \"10\"\n")
             code, out, err = self._run_capture(argv)
         finally:
-            server.shutdown()
+            stop_server(server)
         self.assertEqual(code, 0, err)
         self.assertIn("2/2 passed", out)
 
@@ -798,7 +805,7 @@ class TestRound3(unittest.TestCase):
                 self.assertIn("passed" if "run" in argv else "case(s) changed",
                               out)
         finally:
-            server.shutdown()
+            stop_server(server)
         # a top-level value survives an unset subcommand copy
         args = cli_mod.build_parser().parse_args(
             ["--base-url", "http://x/v1", "--demo", "run", "--prompt", "a",
@@ -897,7 +904,7 @@ class TestRound3(unittest.TestCase):
                               ("sentiment", "v1"), ("sentiment", "v2")])
             self.assertEqual((data["passed"], data["failed"]), (8, 2))
         finally:
-            server.shutdown()
+            stop_server(server)
         # all green -> exit 0
         tmp2 = tempfile.mkdtemp()
         make_suite(tmp2)
@@ -908,7 +915,7 @@ class TestRound3(unittest.TestCase):
                 ["--root", tmp2, "--base-url", url, "run", "--all",
                  "--no-cache"])
         finally:
-            server.shutdown()
+            stop_server(server)
         self.assertEqual(code, 0, err)
         self.assertIn("2 suite(s), 0 with failures; 4/4 cases passed", out)
         # a dead model stops the whole thing with the real reason
@@ -1195,7 +1202,7 @@ class TestRound4(unittest.TestCase):
                 tmp, "cls", "v1", use_cache=False,
                 model_kw={"base_url": url, "model": "fake"})
         finally:
-            server.shutdown()
+            stop_server(server)
         self.assertEqual([r.passed for r in results], [True])
         self.assertEqual(results[0].output, "yes, it's fine")
 
@@ -1217,7 +1224,7 @@ class TestRound4(unittest.TestCase):
                 judge_model_kw={"base_url": judge_url, "model": "fake"})
         finally:
             close()
-            gen.shutdown()
+            stop_server(gen)
         self.assertFalse(r.passed)
         self.assertIn("judge unavailable", r.assertions[0].detail)
         self.assertIn("answered without any text", r.assertions[0].detail)
@@ -1370,8 +1377,8 @@ class TestClosedPipe(unittest.TestCase):
                     self.assertEqual(code, want, (fails, base))
                     self.assertEqual(err, "", (fails, base))
         finally:
-            server.shutdown()
-            server2.shutdown()
+            stop_server(server)
+            stop_server(server2)
         # help / version exit through SystemExit(0), not an error
         for flag in ("-h", "--version"):
             with redirect_stdout(ClosedPipe("write")):
@@ -1479,8 +1486,8 @@ class TestClosedPipe(unittest.TestCase):
                     self.assertEqual(err, "", label)
                     self.assertTrue(self._points_at_null_device(fd), label)
         finally:
-            server.shutdown()
-            server2.shutdown()
+            stop_server(server)
+            stop_server(server2)
 
     def test_windows_closed_pipe_with_one_line_of_output(self):
         # `list` prints a single line: only the final flush can notice that

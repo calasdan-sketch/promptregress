@@ -37,7 +37,7 @@ from . import model as model_mod
 from . import runner as runner_mod
 from . import suite as suite_mod
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 
 
 def _harden_streams() -> None:
@@ -506,7 +506,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="promptregress", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
-    p.add_argument("--root", default=os.getcwd())
+    p.add_argument("--root", default=os.getcwd(),
+                   help="The project folder: prompts/ and .promptregress/ "
+                        "are looked for in it (default: the current "
+                        "directory). Give it before the subcommand.")
     _add_model_options(p, on_subcommand=False)
     sub = p.add_subparsers(dest="cmd", required=True)
 

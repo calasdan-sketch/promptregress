@@ -7,8 +7,9 @@ Handles the subset these tools need:
   - flow-style lists of scalars ("[a, b]")
   - block scalars: literal "|" and folded ">", with "-" (strip) and "+"
     (keep) chomping, as a mapping value or list item
-  - scalars: quoted strings (double quotes take the JSON escapes:
-    backslash-n, backslash-t, escaped quote and backslash, backslash-uXXXX;
+  - scalars: quoted strings (double quotes take YAML's escapes, the table
+    PyYAML reads and writes: backslash followed by 0 a b t n v f r e space
+    quote slash backslash N _ L P, or x / u / U with 2 / 4 / 8 hex digits;
     single quotes are literal, except that a doubled '' is one '),
     ints, floats (ASCII decimal forms; a number remembers the text it was
     written as, see scalar_text), bools, null
@@ -18,9 +19,11 @@ Handles the subset these tools need:
 
 NOT supported (raises ValueError): anchors, aliases, tags, block-scalar
 indentation indicators ("|2"), flow maps, duplicate keys, quoted keys
-("input": x - write input: x). Configs using them get a clear error naming
-the feature and the line number. A key is plain text of ASCII letters,
-digits, spaces and "_ . - /".
+("input": x - write input: x), and a backslash in double quotes that starts
+no YAML escape (a Windows path "C:" + backslash + "Users": write two
+backslashes, or use single quotes) or stands for half a surrogate pair.
+Configs using them get a clear error naming the feature and the line number.
+A key is plain text of ASCII letters, digits, spaces and "_ . - /".
 
 Strictness notes:
   - Every ValueError carries a line number: "miniyaml: <what> (line N)".
@@ -33,7 +36,6 @@ Strictness notes:
 
 from __future__ import annotations
 
-import json
 import re
 
 _KEY_RE = re.compile(r"^([A-Za-z0-9_.\-/ ]+):(?:\s|$)")
@@ -56,6 +58,79 @@ MAX_DEPTH = 50
 
 def _err(msg: str, lineno: int) -> ValueError:
     return ValueError(f"miniyaml: {msg} (line {lineno})")
+
+
+# What can follow the backslash in a double-quoted scalar: YAML 1.2's table,
+# the one PyYAML reads and writes. \x, \u and \U take 2, 4 and 8 hex digits.
+_ESCAPES = {
+    "0": "\x00", "a": "\x07", "b": "\x08", "t": "\t", "\t": "\t", "n": "\n",
+    "v": "\x0b", "f": "\x0c", "r": "\r", "e": "\x1b", " ": " ", '"': '"',
+    "/": "/", "\\": "\\", "N": "\x85", "_": "\xa0",
+    "L": "\N{LINE SEPARATOR}", "P": "\N{PARAGRAPH SEPARATOR}",
+}
+_HEX_ESCAPES = {"x": 2, "u": 4, "U": 8}
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+_ESCAPE_HINT = ("write \\\\ for a backslash, or use single quotes, where "
+                "nothing is an escape")
+
+
+def _shown(text: str) -> str:
+    """`text` for a one-line message: as it is, or escaped when it holds a
+    character that would not print."""
+    return text if text.isprintable() else repr(text)[1:-1]
+
+
+def _double_quoted(s: str, lineno: int) -> str:
+    """The text of the double-quoted scalar `s` (quotes included): every
+    escape of YAML's table decoded, any other backslash sequence an error.
+
+    The two 4-digit escapes json.dumps writes for one emoji are one
+    character, as they always were here; half of such a pair, or a surrogate
+    written with the 8-digit form, cannot be text and is an error. A bare
+    quote in the middle stays as it stands, as it always did."""
+    out: list[str] = []
+    end = len(s) - 1                      # the closing quote
+    i = 1
+    while i < end:
+        ch = s[i]
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        if i + 1 >= end:                  # "abc\" - the quote is escaped
+            raise _err(f"unterminated quoted string: {s!r}", lineno)
+        kind = s[i + 1]
+        if kind in _ESCAPES:
+            out.append(_ESCAPES[kind])
+            i += 2
+            continue
+        if kind not in _HEX_ESCAPES:
+            raise _err("unknown escape " + _shown("\\" + kind) + " in a "
+                       f"double-quoted string ({_ESCAPE_HINT})", lineno)
+        width = _HEX_ESCAPES[kind]
+        digits = s[i + 2:min(i + 2 + width, end)]
+        if len(digits) != width or not _HEX_DIGITS.issuperset(digits):
+            raise _err("\\" + kind + f" needs {width} hex digits, found "
+                       + _shown("\\" + kind + digits) + f" ({_ESCAPE_HINT})",
+                       lineno)
+        start, code = i, int(digits, 16)
+        i += 2 + width
+        if kind == "u" and 0xD800 <= code <= 0xDBFF:
+            low = s[i + 2:i + 6] if s[i:i + 2] == "\\u" else ""
+            if (len(low) == 4 and _HEX_DIGITS.issuperset(low)
+                    and 0xDC00 <= int(low, 16) <= 0xDFFF):
+                code = 0x10000 + ((code - 0xD800) << 10) + int(low, 16) - 0xDC00
+                i += 6
+        escape = s[start:i]
+        if 0xD800 <= code <= 0xDFFF:
+            raise _err(f"{escape} is half of a surrogate pair, not a "
+                       "character (write the character itself, or its "
+                       "8-digit form, as in \\U0001F600)", lineno)
+        if code > 0x10FFFF:
+            raise _err(f"{escape} is beyond U+10FFFF, the last character "
+                       "there is", lineno)
+        out.append(chr(code))
+    return "".join(out)
 
 
 # What leads a line's scalar: indentation, one "- ", one "key: ".
@@ -182,24 +257,15 @@ class _Block:
         self.index = index
 
 
-def _scalar(s: str):
+def _scalar(s: str, lineno: int):
     s = s.strip()
     if s.startswith(_BLOCK_TAG):      # our own placeholder (see safe_load)
         return _Block(int(s[len(_BLOCK_TAG):]))
     if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
-        inner = s[1:-1]
         if s[0] == '"':
-            # Double-quoted scalars use the JSON escape set (\n, \t, \",
-            # \\, \uXXXX); anything JSON rejects (a YAML-only escape such
-            # as \e) keeps the old \" and \\ handling.
-            try:
-                return json.loads(s)
-            except ValueError:
-                inner = inner.replace('\\"', '"').replace("\\\\", "\\")
-        else:
-            # Single quotes are literal; their only escape is '' -> '.
-            inner = inner.replace("''", "'")
-        return inner
+            return _double_quoted(s, lineno)
+        # Single quotes are literal; their only escape is '' -> '.
+        return s[1:-1].replace("''", "'")
     low = s.lower()
     if low in ("null", "~", "none", ""):
         return None
@@ -303,7 +369,7 @@ def _flow_list(s: str, lineno: int) -> list:
     out = []
     for item in raw_items:
         _check_value(item, lineno, in_flow=True)
-        out.append(_scalar(item))
+        out.append(_scalar(item, lineno))
     return out
 
 
@@ -457,7 +523,7 @@ def _parse_map(items, pos, indent, depth):
             if rest.startswith("["):
                 d[key] = _flow_list(rest, lineno)
             else:
-                d[key] = _scalar(rest)
+                d[key] = _scalar(rest, lineno)
         else:
             if pos < len(items) and items[pos][1] > indent:
                 val, pos = _parse_block(items, pos, items[pos][1], depth + 1)
@@ -508,7 +574,7 @@ def _parse_list(items, pos, indent, depth):
                        f"without quotes: {line!r}", lineno)
         else:
             _check_value(content, lineno)
-            lst.append(_scalar(content))
+            lst.append(_scalar(content, lineno))
     return lst, pos
 
 

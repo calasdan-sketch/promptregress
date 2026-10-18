@@ -107,5 +107,40 @@ class TestPackagingMetadata(unittest.TestCase):
                                          attr)))
 
 
+class TestSourceDistribution(unittest.TestCase):
+    """The tests are part of the sdist, so they must find what they read
+    there: setuptools ships the package, the README, the licence and
+    tests/test*.py by itself, but not the CI workflow and the example
+    workflow that TestPythonVersionClaims reads. MANIFEST.in names them."""
+
+    #: files the test suite opens that are not in an sdist by default
+    READ_BY_THE_TESTS = (".github/workflows/ci.yml",
+                         "examples/promptregress-example.yml")
+
+    def manifest(self):
+        lines = (ln.strip() for ln in read("MANIFEST.in").splitlines())
+        return [ln.split() for ln in lines if ln and not ln.startswith("#")]
+
+    def test_manifest_ships_what_the_tests_read(self):
+        included = {args[1] for args in self.manifest()
+                    if args[0] == "include" and len(args) == 2}
+        for path in self.READ_BY_THE_TESTS:
+            with self.subTest(path=path):
+                self.assertIn(path, included)
+                self.assertTrue(os.path.isfile(os.path.join(ROOT, path)))
+
+    def test_every_line_of_the_manifest_names_something_that_exists(self):
+        # a misspelt path is skipped by setuptools with a warning nobody reads
+        for args in self.manifest():
+            with self.subTest(line=" ".join(args)):
+                self.assertIn(args[0], ("include", "recursive-include"))
+                if args[0] == "include":
+                    self.assertTrue(os.path.isfile(
+                        os.path.join(ROOT, *args[1].split("/"))))
+                else:
+                    self.assertTrue(os.path.isdir(
+                        os.path.join(ROOT, *args[1].split("/"))))
+
+
 if __name__ == "__main__":
     unittest.main()

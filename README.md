@@ -90,6 +90,9 @@ prompts/<name>.cases.yaml   golden cases shared across versions
 .promptregress/             response cache (git-ignored by `init`)
 ```
 
+All of it is looked for in the current directory, or in `--root DIR` (given
+before the subcommand: `promptregress --root path/to/project run --all`).
+
 ## Golden cases
 
 ```yaml
@@ -122,17 +125,25 @@ cases:
 Multi-line inputs use YAML block scalars: literal `|` keeps line breaks
 (and trailing spaces), folded `>` joins lines with spaces; add `-` to strip
 or `+` to keep trailing newlines (`|-`, `>+`). Double-quoted strings take
-the JSON escapes (`"line1\nline2"`, `\t`, `\"`, `\\`, `\u00e9`); single-quoted
-strings are literal, except that `''` is one apostrophe (`'it''s'` is
-`it's`). The cases file is read by a small built-in YAML subset
+YAML's escapes: `\n` `\t` `\r` `\"` `\\` `\/` `\0` `\a` `\b` `\v` `\f` `\e`
+`\N` `\_` `\L` `\P`, a backslash and a space, and `\xE9`, `\u00e9` and
+`\U0001F600` (2, 4 and 8 hex digits: how PyYAML writes an accented letter or
+an emoji). Any other backslash there is a line-numbered error, never kept as
+text: a Windows path needs `\\` for each backslash (`"C:\\Users\\dan"`), or
+single quotes (`'C:\Users\dan'`), and half of a surrogate pair (`\ud83d` on
+its own) is not a character. Single-quoted strings are literal, except that
+`''` is one apostrophe (`'it''s'` is `it's`); plain and block scalars have no
+escapes at all. The cases file is read by a small built-in YAML subset
 parser (no PyYAML needed). It reads block mappings and lists - a list may
 start at the indent of its key (`cases:` and `- name: ...` below it, as
 PyYAML writes it) or be indented under it - `[a, b]` lists of scalars, block
 scalars, and plain or quoted values. A key is written without quotes, in
 ASCII letters, digits, spaces and `_ . - /`: a quoted key (`"input": ...`)
 is refused with that fix, as are anchors, aliases, tags, flow maps (`{...}`
-as a value), a nested `[...]`, explicit indentation indicators (`|2`) and a
-key given twice. Each is a line-numbered error.
+as a value), a nested `[...]`, explicit indentation indicators (`|2`), a
+key given twice and a value continued on the next line (PyYAML wraps a long
+string that way unless it is dumped with a large `width`). Each is a
+line-numbered error.
 
 A comment is a `#` that starts a line or follows a space, outside quotes:
 `input: It's fine   # TODO` sends `It's fine`. A quote only opens a quoted
@@ -153,6 +164,14 @@ A case has `name` (optional: `case-0`, `case-1` ... when left out), `input`,
 replaced by the text of `tone`) and `assert` - nothing else. A key such as
 `varss:` would otherwise be dropped without a word; notes go in a `#`
 comment.
+
+The prompt takes a case's input where it says `{{input}}`, spelt exactly so -
+`{{ input }}`, `{{Input}}` and `{input}` are not replaced - and `{{tone}}`
+takes the `tone` the case declares under `vars`. Any other `{{name}}` goes to
+the model as written, and a prompt with no `{{input}}` never sees the inputs
+at all. `run` and `diff` say so on stderr, one `warning:` line per problem
+naming the prompt file, and carry on: the verdict and the exit code are what
+they would have been. Cases that all say `input: ""` need no `{{input}}`.
 
 ### Checked before anything runs
 
@@ -375,10 +394,11 @@ YAML and a CLI — the solo-dev "just run my 30 golden cases in CI" slot.
 
 ## Tests
 
-`python3 -m unittest discover -s tests` (on Python 3.10 one test skips: it
-reads `pyproject.toml` with `tomllib`, new in 3.11). The tests are free: they
-run against fake model servers on 127.0.0.1 and in temporary directories,
-with no API spend.
+`python3 -m unittest discover -s tests`. A few tests skip, and say why: the
+check of `pyproject.toml` needs `tomllib` (Python 3.11 and later), and the
+ones that depend on file permissions skip on Windows and when you run as
+root. The tests are free: they run against fake model servers on 127.0.0.1
+and in temporary directories, with no API spend.
 
 ## License
 

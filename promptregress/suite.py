@@ -51,9 +51,14 @@ def list_prompts(root: str, prompts_dir: str = PROMPTS_DIR
             for k, v in sorted(found.items())}
 
 
+def prompt_path(root: str, name: str, version: str,
+                prompts_dir: str = PROMPTS_DIR) -> str:
+    return os.path.join(root, prompts_dir, f"{name}.{version}.txt")
+
+
 def load_prompt(root: str, name: str, version: str,
                 prompts_dir: str = PROMPTS_DIR) -> str:
-    path = os.path.join(root, prompts_dir, f"{name}.{version}.txt")
+    path = prompt_path(root, name, version, prompts_dir)
     if not os.path.isfile(path):
         raise FileNotFoundError(f"no such prompt: {name}.{version} ({path})")
     with open(path, encoding="utf-8") as f:
@@ -65,6 +70,47 @@ def render(template: str, input_text: str, vars: dict | None = None) -> str:
     for key, val in (vars or {}).items():
         out = out.replace("{{" + key + "}}", str(val))
     return out
+
+
+#: Looks like a placeholder: {{input}}, {{ tone }}, {{Input}}. Double braces
+#: around anything else ({{"label": "x"}}) are not a name.
+_NAME_RE = re.compile(r"\{\{\s*[A-Za-z_][A-Za-z0-9_.-]*\s*\}\}")
+#: At most this many left-over names are listed in one warning line.
+MAX_LEFTOVERS = 5
+
+
+def template_problems(template: str, cases: list[dict]) -> list[str]:
+    """What is wrong with the way `template` takes its cases: short
+    sentences, each meant to follow "<prompt file>: " (empty when all is well).
+
+    render() replaces the exact text {{input}} and, for each key of a case's
+    vars, {{key}}. Anything else - {{ input }}, {{Input}}, {input}, a name no
+    var declares - reaches the model as it is written, and a prompt with no
+    {{input}} never sees the case input at all: the suite then tests nothing
+    and passes. Nothing here changes a verdict; the caller warns."""
+    problems: list[str] = []
+    if "{{input}}" not in template and any(
+            str(case.get("input", "")).strip() for case in cases):
+        problems.append(
+            "no {{input}} in the prompt, so the input of the cases is never "
+            "sent to the model (the placeholder is exactly {{input}}: not "
+            "{{ input }}, {{Input}} or {input})")
+    left: list[str] = []
+    for case in cases:
+        # what render() leaves of the template for this case
+        declared = {key: "" for key in (case.get("vars") or {})}
+        for token in _NAME_RE.findall(render(template, "", declared)):
+            if token not in left:
+                left.append(token)
+    if left:
+        shown = ", ".join(left[:MAX_LEFTOVERS])
+        if len(left) > MAX_LEFTOVERS:
+            shown += f" and {len(left) - MAX_LEFTOVERS} more"
+        problems.append(
+            f"{shown} {'is' if len(left) == 1 else 'are'} left as written in "
+            "the prompt: only {{input}} and a {{name}} the case declares "
+            "under vars are replaced")
+    return problems
 
 
 CASE_KEYS = ("name", "input", "vars", "assert")

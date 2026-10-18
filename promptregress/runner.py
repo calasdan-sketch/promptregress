@@ -218,6 +218,15 @@ def run_case(root: str, prompt_name: str, version: str, prompt_text: str,
                       output=output, assertions=results, cached=cached)
 
 
+def _warn_about_template(root: str, prompt_name: str, version: str,
+                         prompt_text: str, cases: list[dict]) -> None:
+    """One stderr line per problem, each naming the prompt file. The run
+    goes on and its verdict is what it was: a prompt may not want an input."""
+    path = suite_mod.prompt_path(root, prompt_name, version)
+    for problem in suite_mod.template_problems(prompt_text, cases):
+        print(f"warning: {path}: {problem}", file=sys.stderr)
+
+
 def run_suite(root: str, prompt_name: str, version: str,
               cases: list[dict] | None = None,
               model_kw: dict | None = None,
@@ -234,6 +243,7 @@ def run_suite(root: str, prompt_name: str, version: str,
     prompt_text = suite_mod.load_prompt(root, prompt_name, version)
     cases = cases if cases is not None else suite_mod.load_cases(root,
                                                                  prompt_name)
+    _warn_about_template(root, prompt_name, version, prompt_text, cases)
     results = []
     for c in cases:
         r = run_case(root, prompt_name, version, prompt_text, c,
