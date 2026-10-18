@@ -1,7 +1,8 @@
 """Minimal YAML subset parser (stdlib only).
 
 Handles the subset these tools need:
-  - block mappings and lists, nested by indentation
+  - block mappings and lists, nested by indentation. A list may start at
+    the indent of its key (PyYAML's own layout) or deeper
   - inline-map list items ("- key: value")
   - flow-style lists of scalars ("[a, b]")
   - block scalars: literal "|" and folded ">", with "-" (strip) and "+"
@@ -16,8 +17,10 @@ Handles the subset these tools need:
     the apostrophe in `It's fine   # TODO` does not hide the comment
 
 NOT supported (raises ValueError): anchors, aliases, tags, block-scalar
-indentation indicators ("|2"), flow maps, duplicate keys. Configs using them get a
-clear error naming the feature and the line number.
+indentation indicators ("|2"), flow maps, duplicate keys, quoted keys
+("input": x - write input: x). Configs using them get a clear error naming
+the feature and the line number. A key is plain text of ASCII letters,
+digits, spaces and "_ . - /".
 
 Strictness notes:
   - Every ValueError carries a line number: "miniyaml: <what> (line N)".
@@ -77,6 +80,22 @@ def _quoted_end(s: str, i: int) -> int | None:
         else:
             return i + 1
     return None
+
+
+def _quoted_key(text: str) -> bool:
+    """Whether `text` starts with a quoted key: "input": x, 'input': x."""
+    if text[:1] not in ("'", '"'):
+        return False
+    end = _quoted_end(text, 0)
+    if end is None:
+        return False
+    rest = text[end:].lstrip(" \t")
+    return rest[:1] == ":" and rest[1:2] in ("", " ", "\t")
+
+
+def _is_item(line: str) -> bool:
+    """Whether a line is a list item: "- x", or "-" alone."""
+    return line == "-" or line.startswith("- ")
 
 
 def _flow_end(s: str, i: int) -> int:
@@ -416,13 +435,17 @@ def _parse_map(items, pos, indent, depth):
             break
         if ind > indent:
             raise _err(f"bad indentation: {line!r}", lineno)
-        if line == "-" or line.startswith("- "):
-            raise _err(f"list item inside mapping: {line!r}", lineno)
+        if _is_item(line):
+            raise _err(f"list item inside mapping: {line!r} (a list needs "
+                       f"a `key:` line above it)", lineno)
         if line[0] in "&*!":
             # Anchor/alias/tag where a key was expected — name it.
             _check_value(line, lineno)
         m = _KEY_RE.match(line)
         if not m:
+            if _quoted_key(line):
+                raise _err("quoted keys are not supported - write the key "
+                           f"without quotes: {line!r}", lineno)
             raise _err(f"expected 'key: value', got: {line!r}", lineno)
         key = m.group(1).strip()
         rest = line[m.end():].strip()
@@ -439,6 +462,13 @@ def _parse_map(items, pos, indent, depth):
             if pos < len(items) and items[pos][1] > indent:
                 val, pos = _parse_block(items, pos, items[pos][1], depth + 1)
                 d[key] = val
+            elif (pos < len(items) and items[pos][1] == indent
+                  and _is_item(items[pos][2])):
+                # a list at the indent of its key: `key:` then `- x`, as
+                # PyYAML writes it. It ends at the first line that is not
+                # an item, and the map goes on from there.
+                val, pos = _parse_block(items, pos, indent, depth + 1)
+                d[key] = val
             else:
                 d[key] = None
     return d, pos
@@ -452,7 +482,7 @@ def _parse_list(items, pos, indent, depth):
             break
         if ind > indent:
             raise _err(f"bad indentation: {line!r}", lineno)
-        if not (line == "-" or line.startswith("- ")):
+        if not _is_item(line):
             break  # end of list; parent map continues
         content = line[1:].strip()
         pos += 1
@@ -473,6 +503,9 @@ def _parse_list(items, pos, indent, depth):
         elif content.startswith("[") and content.endswith("]"):
             _check_value(content, lineno)
             lst.append(_flow_list(content, lineno))
+        elif _quoted_key(content):
+            raise _err("quoted keys are not supported - write the key "
+                       f"without quotes: {line!r}", lineno)
         else:
             _check_value(content, lineno)
             lst.append(_scalar(content))

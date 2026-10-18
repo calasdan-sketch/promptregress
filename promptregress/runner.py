@@ -15,6 +15,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import sys
 
 from . import asserts as asserts_mod
 from . import model as model_mod
@@ -28,8 +29,20 @@ CACHE_GITIGNORE = ("# promptregress response cache: safe to delete, "
                    "never commit\n*\n!.gitignore\n")
 
 
+def error_text(e: BaseException) -> str:
+    """One line for the user. An error of ours (a ValueError, a
+    FileNotFoundError("no cases file: ...")) reads as it was written; a
+    read or write that failed in the system names the path and the reason
+    ("prompts/a.v1.txt: Permission denied"), not Python's "[Errno 13] ..."."""
+    if isinstance(e, OSError) and e.errno is not None:
+        why = e.strerror or str(e)
+        return f"{e.filename}: {why}" if e.filename else why
+    return str(e)
+
+
 def ensure_cache_ignored(root: str) -> bool:
-    """Create .promptregress/.gitignore if missing. True when written."""
+    """Create .promptregress/.gitignore if missing. True when written.
+    Raises OSError when it cannot be written."""
     d = os.path.join(root, CACHE_ROOT)
     p = os.path.join(d, ".gitignore")
     if os.path.exists(p):
@@ -85,12 +98,41 @@ def _cache_read(root: str, key: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _cache_write(root: str, key: str, payload: dict) -> None:
+#: Roots whose cache could not be written, with the reason. The first
+#: failure of a command prints one warning and ends that root's cache
+#: writes; cli.main() empties this at the start of every command.
+_cache_off: dict[str, str] = {}
+
+
+def reset_cache_warnings() -> None:
+    """Forget which roots had their cache switched off (a command warns
+    once; the next command starts afresh)."""
+    _cache_off.clear()
+
+
+def _cache_write(root: str, key: str, payload: dict) -> bool:
+    """Store `payload` under `key`. True when it was stored.
+
+    The cache only saves money, so a write that fails - a file where the
+    folder belongs, a read-only or full disk, a checkout owned by another
+    user - never fails or crashes a run: the first failure prints one
+    warning on stderr, the rest are skipped, and the command goes on
+    without a cache. The .gitignore is written first and nothing is cached
+    without it: model output must not end up in a commit."""
+    if root in _cache_off:
+        return False
     p = _cache_path(root, key)
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    ensure_cache_ignored(root)
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(payload, f)
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        ensure_cache_ignored(root)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+    except OSError as e:
+        why = _cache_off[root] = error_text(e)
+        print(f"warning: cache disabled: cannot write {why} "
+              "(the run goes on without it)", file=sys.stderr)
+        return False
+    return True
 
 
 def _provider(model_kw: dict) -> tuple[str, str]:

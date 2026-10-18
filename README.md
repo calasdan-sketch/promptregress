@@ -125,9 +125,14 @@ or `+` to keep trailing newlines (`|-`, `>+`). Double-quoted strings take
 the JSON escapes (`"line1\nline2"`, `\t`, `\"`, `\\`, `\u00e9`); single-quoted
 strings are literal, except that `''` is one apostrophe (`'it''s'` is
 `it's`). The cases file is read by a small built-in YAML subset
-parser (no PyYAML needed); anchors, aliases, tags, flow maps (`{...}` as a
-value) and explicit indentation indicators (`|2`) are rejected with a
-line-numbered error.
+parser (no PyYAML needed). It reads block mappings and lists - a list may
+start at the indent of its key (`cases:` and `- name: ...` below it, as
+PyYAML writes it) or be indented under it - `[a, b]` lists of scalars, block
+scalars, and plain or quoted values. A key is written without quotes, in
+ASCII letters, digits, spaces and `_ . - /`: a quoted key (`"input": ...`)
+is refused with that fix, as are anchors, aliases, tags, flow maps (`{...}`
+as a value), a nested `[...]`, explicit indentation indicators (`|2`) and a
+key given twice. Each is a line-numbered error.
 
 A comment is a `#` that starts a line or follows a space, outside quotes:
 `input: It's fine   # TODO` sends `It's fine`. A quote only opens a quoted
@@ -184,12 +189,15 @@ assertion fails that case with `bad assertion: ...`, it never crashes the run.
 - `schema` is a mini validator: `type` (one JSON type name, or a list of
   them: `type: [integer, "null"]`), `enum`, `required`, `properties` and
   `items`. `required`, `properties` and `items` apply to any object or array,
-  with or without a `type` beside them. A keyword beyond those (`minimum`,
-  `pattern`, `additionalProperties`, `oneOf` ...) would pass every reply
-  whatever it said, so it is an error, not ignored - and so is a type name
-  JSON does not have (`str`, `int`: write `string`, `integer`). The
-  annotations `title`, `description`, `$schema`, `default` and `examples` are
-  accepted and ignored.
+  with or without a `type` beside them. `enum` compares as JSON does: `true`
+  is not the number 1 (nor `false` the number 0), `1` equals `1.0`, and
+  lists and objects are compared item by item the same way, in any key
+  order. A keyword beyond those (`minimum`, `pattern`,
+  `additionalProperties`, `oneOf` ...) would pass every reply whatever it
+  said, so it is an error, not ignored - and so is a type name JSON does not
+  have (`str`, `int`: write `string`, `integer`). The annotations `title`,
+  `description`, `$schema`, `default` and `examples` are accepted and
+  ignored.
 - `max_tokens` / `min_tokens` use a rough estimate of one token per 4
   characters - a guardrail, not a tokenizer. An empty or blank reply is 0
   tokens, so `min_tokens: 1` fails it.
@@ -262,6 +270,13 @@ cache, so fake-model answers can't make a later real run pass. The cache
 directory carries its own `.gitignore` (written by `init` and by the first
 cached run), so it stays out of your commits.
 
+The cache only saves money, so it never fails a run. When it cannot be
+written - a read-only or root-owned checkout, a file where
+`.promptregress/cache` belongs, a full disk - the command prints one
+`warning: cache disabled: ...` line on stderr and carries on without it:
+the same verdicts and exit code, only the next run pays again. Nothing is
+cached while the `.gitignore` cannot be written.
+
 ## CI
 
 ```bash
@@ -299,7 +314,7 @@ The same for the human report and `--format json`:
 |---|---|
 | `0` | `run`: every case passed. `list`, `init`: done. `diff`: the comparison was made, whatever it shows |
 | `1` | `run`: at least one case failed |
-| `2` | usage or configuration error, nothing judged: a prompt or cases file that is missing or malformed; a cases file with no cases (`case:` typed for `cases:`, `cases: []`, an empty file) or with a case or an assertion that cannot be used (see "Checked before anything runs"); an API key that cannot be sent (see Model endpoint); a model that cannot be used (unreachable, rejecting the call, redirecting). `list` exits 2 too when a cases file is invalid |
+| `2` | usage or configuration error, nothing judged: a prompt or cases file that is missing or malformed; a cases file with no cases (`case:` typed for `cases:`, `cases: []`, an empty file) or with a case or an assertion that cannot be used (see "Checked before anything runs"); a file that cannot be read or written (a prompt file you may not open; `init` in a read-only folder); an API key that cannot be sent (see Model endpoint); a model that cannot be used (unreachable, rejecting the call, redirecting). `list` exits 2 too when a cases file is invalid or unreadable. A response cache that cannot be written is not an error (see Caching) |
 
 A suite with nothing in it never passes: a CI job that ran no cases would
 be green and test nothing.

@@ -15,9 +15,11 @@ diff versions A/B, and catch prompt drift before your users do.
 Exit status: 0 every case passed (or the command is done); 1 a case failed;
 2 usage or configuration error, nothing was judged: a prompt or cases file
 that is missing or unusable (no cases, an assertion that does not exist ...),
-an API key that cannot be sent, a model that cannot be used. `diff` only
-reports: it exits 0 whenever the comparison was made, whether or not verdicts
-flipped (a flip can be a fix as well as a regression; gate builds with `run`).
+a file that cannot be read or written (`init` in a read-only folder), an API
+key that cannot be sent, a model that cannot be used. `diff` only reports: it
+exits 0 whenever the comparison was made, whether or not verdicts flipped (a
+flip can be a fix as well as a regression; gate builds with `run`). A response
+cache that cannot be written is no error: it is skipped, with one warning.
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ from . import model as model_mod
 from . import runner as runner_mod
 from . import suite as suite_mod
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 
 def _harden_streams() -> None:
@@ -208,14 +210,20 @@ def scaffold_example(root: str) -> list[str]:
 
 
 def cmd_init(args) -> int:
-    written = scaffold_example(args.root)
-    if written:
-        print(f"scaffolded prompts/: {', '.join(written)}")
-    else:
-        print("prompts/ already scaffolded")
-    if runner_mod.ensure_cache_ignored(args.root):
-        print(f"wrote {runner_mod.CACHE_ROOT}/.gitignore "
-              "(the response cache is never committed)")
+    try:
+        written = scaffold_example(args.root)
+        if written:
+            print(f"scaffolded prompts/: {', '.join(written)}")
+        else:
+            print("prompts/ already scaffolded")
+        if runner_mod.ensure_cache_ignored(args.root):
+            print(f"wrote {runner_mod.CACHE_ROOT}/.gitignore "
+                  "(the response cache is never committed)")
+    except OSError as e:
+        # asked to write files and unable to: a real failure, not a traceback
+        print(f"error: init could not write its files: "
+              f"{runner_mod.error_text(e)}", file=sys.stderr)
+        return 2
     print("Point PROMPTREGRESS_BASE_URL at your model "
           "(default: Ollama at http://localhost:11434/v1).")
     return 0
@@ -258,6 +266,9 @@ def cmd_list(args) -> int:
         except ValueError as e:
             shown = "invalid cases file"
             problems.append(str(e))
+        except OSError as e:
+            shown = "unreadable cases file"
+            problems.append(runner_mod.error_text(e))
         print(f"{name}: versions {', '.join(versions)} ({shown})")
     for problem in problems:
         print(f"error: {problem}", file=sys.stderr)
@@ -325,8 +336,8 @@ def _load_suites(root: str, names) -> dict | None:
     for name in dict.fromkeys(names):
         try:
             loaded[name] = suite_mod.load_cases(root, name)
-        except (FileNotFoundError, ValueError) as e:
-            print(f"error: {e}", file=sys.stderr)
+        except (OSError, ValueError) as e:
+            print(f"error: {runner_mod.error_text(e)}", file=sys.stderr)
             usable = False
     return loaded if usable else None
 
@@ -338,8 +349,8 @@ def _run_or_error(root, name, version, args, cases=None):
         results, _ = runner_mod.run_suite(
             root, name, version, cases=cases, model_kw=_model_kw(args),
             use_cache=_use_cache(args))
-    except (FileNotFoundError, ValueError) as e:
-        print(f"error: {e}", file=sys.stderr)
+    except (OSError, ValueError) as e:
+        print(f"error: {runner_mod.error_text(e)}", file=sys.stderr)
         return None, 2
     err = _first_error(results)
     if err:
@@ -575,8 +586,16 @@ def main(argv=None) -> int:
             except model_mod.ModelError as e:
                 print(f"error: {e}", file=sys.stderr)
                 return 2
-        return {"init": cmd_init, "list": cmd_list,
-                "run": cmd_run, "diff": cmd_diff}[args.cmd](args)
+        runner_mod.reset_cache_warnings()
+        try:
+            return {"init": cmd_init, "list": cmd_list,
+                    "run": cmd_run, "diff": cmd_diff}[args.cmd](args)
+        except OSError as e:
+            # whatever file trouble nothing above handled (an unreadable
+            # prompts folder ...): one line and exit 2, never a traceback
+            # and never the 1 that means "a case failed"
+            print(f"error: {runner_mod.error_text(e)}", file=sys.stderr)
+            return 2
 
 
 if __name__ == "__main__":

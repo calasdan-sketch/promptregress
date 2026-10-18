@@ -132,6 +132,21 @@ def check_schema(schema, path: str = "schema") -> None:
         check_schema(schema["items"], f"{path}.items")
 
 
+def _same_json(a, b) -> bool:
+    """Whether two JSON values are equal: true is no number (Python says
+    True == 1, JSON does not), 1 is 1.0, and lists and objects are compared
+    item by item the same way. Key order does not matter."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_same_json(a[k], b[k]) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(map(_same_json, a, b))
+    if isinstance(a, (dict, list)) or isinstance(b, (dict, list)):
+        return False
+    return a == b
+
+
 def _check_schema(data, schema: dict, path: str = "$") -> list[str]:
     """Minimal JSON-schema validator (see check_schema for what it checks).
     Returns list of error strings. required / properties apply to any object
@@ -144,7 +159,8 @@ def _check_schema(data, schema: dict, path: str = "$") -> list[str]:
             errors.append(f"{path}: expected {' or '.join(names)}, "
                           f"got {type(data).__name__}")
             return errors
-    if "enum" in schema and data not in schema["enum"]:
+    if "enum" in schema and not any(_same_json(data, member)
+                                    for member in schema["enum"]):
         errors.append(f"{path}: {data!r} not in enum {schema['enum']}")
     if isinstance(data, dict):
         for req in schema.get("required", []):
