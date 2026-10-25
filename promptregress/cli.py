@@ -37,7 +37,7 @@ from . import model as model_mod
 from . import runner as runner_mod
 from . import suite as suite_mod
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 
 
 def _harden_streams() -> None:
@@ -132,26 +132,42 @@ class _PipeSafe:
         return getattr(self._stream, name)
 
 
+class _StreamState:
+    """What happened to the output streams while main() ran."""
+
+    def __init__(self):
+        self.write_error = None   # the OSError that stopped the output
+
+
 @contextlib.contextmanager
 def _closed_pipe_tolerant():
-    """Run the body with stdout and stderr wrapped in _PipeSafe."""
+    """Run the body with stdout and stderr wrapped in _PipeSafe. Yields a
+    _StreamState; a stream that cannot take its output (a full disk, `>
+    /dev/full`) is recorded there, never raised, because this runs after
+    the command: a traceback here would replace its exit code with 120."""
+    state = _StreamState()
     real = (sys.stdout, sys.stderr)  # either is None under pythonw
     safe = tuple(_PipeSafe(s) if s is not None else None for s in real)
     sys.stdout, sys.stderr = safe
     try:
-        yield
+        yield state
     finally:
-        try:
-            # Flush now, with the command done, while a closed pipe is
-            # still handled. A small output only ever sits in the buffer,
-            # so nothing has failed yet; left to the interpreter's flush
-            # at exit, the error would be "Exception ignored" and the exit
-            # code 120 instead of the command's own.
-            for s in safe:
-                if s is not None:
-                    s.flush()
-        finally:
-            sys.stdout, sys.stderr = real
+        # Flush now, with the command done, while a closed pipe is still
+        # handled. A small output only ever sits in the buffer, so nothing
+        # has failed yet; left to the interpreter's flush at exit, the
+        # error would be "Exception ignored" and the exit code 120 instead
+        # of the command's own.
+        for s, raw in zip(safe, real):
+            if s is None:
+                continue
+            try:
+                s.flush()
+            except (OSError, ValueError) as e:
+                if state.write_error is None:
+                    state.write_error = e
+                # what is left in the buffer must not fail again at exit
+                _discard_output(raw)
+        sys.stdout, sys.stderr = real
 
 
 def _model_kw(args) -> dict:
@@ -548,62 +564,76 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     _harden_streams()
+    reported = [False]
     with contextlib.ExitStack() as stack:
         # `... | head -1` must neither traceback nor change the exit code.
-        stack.enter_context(_closed_pipe_tolerant())
-        args = build_parser().parse_args(argv)
-        # Resources a subcommand opens (the demo's scaffold dir) are
-        # released here, however the command ends.
-        args.cleanup = stack
-        if args.demo and args.cmd in ("run", "diff"):
-            # Zero-dependency trial: ALWAYS the in-process fake model.
-            # A PROMPTREGRESS_BASE_URL left in the environment (or a
-            # --base-url) used to win silently and hit a real server.
-            demo_server, url = demo_mod.start_demo_model()
-            stack.callback(demo_server.server_close)   # runs after shutdown
-            stack.callback(demo_server.shutdown)
-            shown = model_mod._without_userinfo
-            ignored = ([f"--base-url {shown(args.base_url)}"]
-                       if args.base_url else [])
-            if os.environ.get("PROMPTREGRESS_BASE_URL"):
-                ignored.append("PROMPTREGRESS_BASE_URL="
-                               f"{shown(os.environ['PROMPTREGRESS_BASE_URL'])}")
-            if ignored:
-                print("(demo: using the built-in fake model; ignoring "
-                      f"{', '.join(ignored)})", file=sys.stderr)
-            args.base_url = url
-            # the fake model has no use for a key, and one left in the real
-            # environment (even a broken one) is none of its business; nor
-            # are the limits the environment sets
-            args.api_key = "demo"
-            if args.timeout is None:
-                args.timeout = model_mod.DEFAULT_TIMEOUT
-            if args.max_reply_bytes is None:
-                args.max_reply_bytes = model_mod.DEFAULT_MAX_REPLY_BYTES
-        elif args.cmd in ("run", "diff"):
-            # a key that cannot be sent, a limit that is not a number: a
-            # configuration error. Say so before the first request, whether
-            # or not the cache could have answered
-            try:
-                model_mod.check_key(model_mod.resolve_api_key(args.api_key))
-                model_mod.resolve_timeout(args.timeout)
-                model_mod.resolve_max_reply_bytes(args.max_reply_bytes)
-            except model_mod.ModelError as e:
-                print(f"error: {e}", file=sys.stderr)
-                return 2
-        runner_mod.reset_cache_warnings()
+        state = stack.enter_context(_closed_pipe_tolerant())
+        rc = _run(argv, stack, reported)
+    if state.write_error is not None:
+        # The output could not be written (found when the streams were
+        # flushed): the report never arrived. Exit 2 and one line.
+        if not reported[0]:
+            e = state.write_error
+            _say_error("error: could not write the output: "
+                       f"{getattr(e, 'strerror', None) or e}")
+        return 2
+    return rc
+
+
+def _run(argv, stack, reported) -> int:
+    args = build_parser().parse_args(argv)
+    # Resources a subcommand opens (the demo's scaffold dir) are
+    # released here, however the command ends.
+    args.cleanup = stack
+    if args.demo and args.cmd in ("run", "diff"):
+        # Zero-dependency trial: ALWAYS the in-process fake model.
+        # A PROMPTREGRESS_BASE_URL left in the environment (or a
+        # --base-url) used to win silently and hit a real server.
+        demo_server, url = demo_mod.start_demo_model()
+        stack.callback(demo_server.server_close)   # runs after shutdown
+        stack.callback(demo_server.shutdown)
+        shown = model_mod._without_userinfo
+        ignored = ([f"--base-url {shown(args.base_url)}"]
+                   if args.base_url else [])
+        if os.environ.get("PROMPTREGRESS_BASE_URL"):
+            ignored.append("PROMPTREGRESS_BASE_URL="
+                           f"{shown(os.environ['PROMPTREGRESS_BASE_URL'])}")
+        if ignored:
+            print("(demo: using the built-in fake model; ignoring "
+                  f"{', '.join(ignored)})", file=sys.stderr)
+        args.base_url = url
+        # the fake model has no use for a key, and one left in the real
+        # environment (even a broken one) is none of its business; nor
+        # are the limits the environment sets
+        args.api_key = "demo"
+        if args.timeout is None:
+            args.timeout = model_mod.DEFAULT_TIMEOUT
+        if args.max_reply_bytes is None:
+            args.max_reply_bytes = model_mod.DEFAULT_MAX_REPLY_BYTES
+    elif args.cmd in ("run", "diff"):
+        # a key that cannot be sent, a limit that is not a number: a
+        # configuration error. Say so before the first request, whether
+        # or not the cache could have answered
         try:
-            return {"init": cmd_init, "list": cmd_list,
-                    "run": cmd_run, "diff": cmd_diff}[args.cmd](args)
-        except OSError as e:
-            # whatever file trouble nothing above handled (an unreadable
-            # prompts folder ...): one line and exit 2, never a traceback
-            # and never the 1 that means "a case failed"
-            _say_error(f"error: {runner_mod.error_text(e)}")
+            model_mod.check_key(model_mod.resolve_api_key(args.api_key))
+            model_mod.resolve_timeout(args.timeout)
+            model_mod.resolve_max_reply_bytes(args.max_reply_bytes)
+        except model_mod.ModelError as e:
+            print(f"error: {e}", file=sys.stderr)
             return 2
+    runner_mod.reset_cache_warnings()
+    try:
+        return {"init": cmd_init, "list": cmd_list,
+                "run": cmd_run, "diff": cmd_diff}[args.cmd](args)
+    except OSError as e:
+        # whatever file trouble nothing above handled (an unreadable
+        # prompts folder ...): one line and exit 2, never a traceback
+        # and never the 1 that means "a case failed"
+        reported[0] = _say_error(f"error: {runner_mod.error_text(e)}")
+        return 2
 
 
-def _say_error(message: str) -> None:
+def _say_error(message: str) -> bool:
     """One line on stderr, if stderr can take it. When it cannot (a full
     disk, a closed descriptor) there is nobody to tell: the exit code 2 still
     says "could not run", and it must not become a traceback with 1, which
@@ -611,8 +641,10 @@ def _say_error(message: str) -> None:
     try:
         print(message, file=sys.stderr)
         sys.stderr.flush()
+        return True
     except (OSError, ValueError):
-        pass
+        _discard_output(sys.stderr)
+        return False
 
 
 if __name__ == "__main__":

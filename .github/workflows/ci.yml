@@ -35,7 +35,7 @@ jobs:
         run: promptregress --demo run --prompt sentiment --version v1
 
   package:
-    name: build, twine check, install the wheel
+    name: build, twine check, sdist tests, install the wheel
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,6 +48,16 @@ jobs:
           python -m build
       - name: Check the metadata
         run: twine check --strict dist/*
+      - name: The source distribution passes its own tests
+        run: |
+          set -e
+          work="$RUNNER_TEMP/sdist-check"
+          rm -rf "$work"; mkdir -p "$work/src"
+          tar -xzf dist/*.tar.gz -C "$work/src"
+          python -m venv "$work/venv"
+          "$work/venv/bin/pip" install dist/*.tar.gz
+          cd "$work"/src/*/
+          "$work/venv/bin/python" -m unittest discover -s tests
       - name: Install the wheel in a clean environment and run it
         run: |
           python -m venv "$RUNNER_TEMP/wheel-venv"

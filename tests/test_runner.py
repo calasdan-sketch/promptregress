@@ -1389,10 +1389,14 @@ class TestClosedPipe(unittest.TestCase):
     def test_stdout_is_restored_and_other_write_errors_still_raise(self):
         # only a closed pipe is tolerated: a full disk is still an error
         out = ClosedPipe("write", OSError(errno.ENOSPC, "No space left"))
-        with redirect_stdout(out):
-            with self.assertRaises(OSError) as ctx:
-                cli_mod.main(["--root", tempfile.mkdtemp(), "list"])
-        self.assertEqual(ctx.exception.errno, errno.ENOSPC)
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            # a full disk is not a closed pipe: the output was lost, so
+            # exit 2 ("could not run") with one line, never a traceback
+            self.assertEqual(
+                cli_mod.main(["--root", tempfile.mkdtemp(), "list"]), 2)
+        self.assertEqual(len(err.getvalue().strip().splitlines()), 1)
+        self.assertIn("No space left", err.getvalue())
         buf = io.StringIO()
         with redirect_stdout(buf):
             cli_mod.main(["--root", tempfile.mkdtemp(), "list"])
@@ -1515,14 +1519,17 @@ class TestClosedPipe(unittest.TestCase):
             for fails in ("flush", "write"):
                 fd = self._dead_pipe_fd()
                 out = ClosedPipe(fails, OSError(*error), fd)
+                err = io.StringIO()
                 with mock.patch.object(cli_mod, "_IS_WINDOWS", windows):
-                    with redirect_stdout(out):
-                        with self.assertRaises(OSError) as ctx:
-                            cli_mod.main(
-                                ["--root", tempfile.mkdtemp(), "list"])
+                    with redirect_stdout(out), redirect_stderr(err):
+                        code = cli_mod.main(
+                            ["--root", tempfile.mkdtemp(), "list"])
                 label = (windows, error[0], fails)
-                self.assertEqual(ctx.exception.errno, error[0], label)
-                self.assertFalse(self._points_at_null_device(fd), label)
+                # not a closed pipe, so not silent: exit 2 and one line
+                self.assertEqual(code, 2, label)
+                self.assertEqual(len(err.getvalue().strip().splitlines()),
+                                 1, label)
+                self.assertIn(error[1], err.getvalue(), label)
 
     def test_windows_exit_flush_is_clean(self):
         # The symptom itself, end to end: stdout rebuilt on a raw stream

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.5
+
+- A report or an error line that cannot be written (`> /dev/full`,
+  `2>/dev/full`, a full disk) now really exits 2 with no traceback. In 0.1.4
+  the last flush at the end of the run still failed and the exit code was 120.
+  A closed pipe (`promptregress run | head -1`) still keeps the verdict as the
+  exit code.
+- The release workflow only publishes a tag that sits on `main`, and the build
+  also runs the tests from the unpacked source distribution.
+
 ## 0.1.4
 
 - `--base-url` (and `PROMPTREGRESS_BASE_URL`) must be an `http://` or
