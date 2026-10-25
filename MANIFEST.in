@@ -2,5 +2,7 @@
 # and the example workflow (TestPythonVersionClaims). Every module under tests/
 # goes in, so an unpacked sdist runs its own tests.
 include .github/workflows/ci.yml
+include .github/workflows/release.yml
 include examples/promptregress-example.yml
 recursive-include tests *.py
+include CHANGELOG.md

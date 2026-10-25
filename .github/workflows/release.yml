@@ -1,0 +1,58 @@
+# Publishes to PyPI when a version tag (v*) is pushed. PyPI "trusted
+# publishing": no token is stored; PyPI trusts this repository, this workflow
+# and the `pypi` environment (set up once under the project's Publishing page).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: The tag must equal the version in pyproject.toml
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os, sys, tomllib
+          with open("pyproject.toml", "rb") as f:
+              version = tomllib.load(f)["project"]["version"]
+          tag = os.environ["TAG"]
+          if tag != "v" + version:
+              sys.exit(f"tag {tag} does not match pyproject version {version}")
+          print("tag", tag, "matches version", version)
+          PY
+      - name: Build
+        run: |
+          python -m pip install build twine
+          python -m build
+      - name: Check the metadata
+        run: twine check --strict dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    # Only this job may mint the OIDC token PyPI exchanges for upload rights.
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

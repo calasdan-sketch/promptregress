@@ -66,10 +66,22 @@ _TYPE_TESTS = {
     "array": lambda v: isinstance(v, list),
     "string": lambda v: isinstance(v, str),
     "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
-    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    # JSON Schema: 1.0 is an integer too (Python's json reads `1.0` as a float)
+    "integer": lambda v: (isinstance(v, int) and not isinstance(v, bool))
+    or (isinstance(v, float) and v.is_integer()),
     "boolean": lambda v: isinstance(v, bool),
     "null": lambda v: v is None,
 }
+
+
+def _no_constant(name: str):
+    raise ValueError(f"{name} is not valid JSON")
+
+
+def loads(text: str):
+    """json.loads, strictly: NaN, Infinity and -Infinity are Python
+    extensions, not JSON (a model that writes them has not written JSON)."""
+    return json.loads(text, parse_constant=_no_constant)
 
 
 def describe(value) -> str:
@@ -342,7 +354,7 @@ def evaluate(assertion: dict, output: str) -> tuple[bool, str]:
     if kind == "json_valid":
         wanted = _flag(kind, want)
         try:
-            json.loads(output)
+            loads(output)
             problem = None
         except (ValueError, RecursionError) as e:   # nested too deep: no JSON
             problem = str(e)
@@ -355,7 +367,7 @@ def evaluate(assertion: dict, output: str) -> tuple[bool, str]:
     if kind == "schema":
         check_schema(want)
         try:
-            data = json.loads(output)
+            data = loads(output)
         except (ValueError, RecursionError) as e:
             return False, f"schema check needs JSON, got: {e}"
         errors = _check_schema(data, want)

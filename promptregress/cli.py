@@ -37,7 +37,7 @@ from . import model as model_mod
 from . import runner as runner_mod
 from . import suite as suite_mod
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 
 
 def _harden_streams() -> None:
@@ -562,10 +562,12 @@ def main(argv=None) -> int:
             demo_server, url = demo_mod.start_demo_model()
             stack.callback(demo_server.server_close)   # runs after shutdown
             stack.callback(demo_server.shutdown)
-            ignored = [f"--base-url {args.base_url}"] if args.base_url else []
+            shown = model_mod._without_userinfo
+            ignored = ([f"--base-url {shown(args.base_url)}"]
+                       if args.base_url else [])
             if os.environ.get("PROMPTREGRESS_BASE_URL"):
                 ignored.append("PROMPTREGRESS_BASE_URL="
-                               f"{os.environ['PROMPTREGRESS_BASE_URL']}")
+                               f"{shown(os.environ['PROMPTREGRESS_BASE_URL'])}")
             if ignored:
                 print("(demo: using the built-in fake model; ignoring "
                       f"{', '.join(ignored)})", file=sys.stderr)
@@ -597,8 +599,20 @@ def main(argv=None) -> int:
             # whatever file trouble nothing above handled (an unreadable
             # prompts folder ...): one line and exit 2, never a traceback
             # and never the 1 that means "a case failed"
-            print(f"error: {runner_mod.error_text(e)}", file=sys.stderr)
+            _say_error(f"error: {runner_mod.error_text(e)}")
             return 2
+
+
+def _say_error(message: str) -> None:
+    """One line on stderr, if stderr can take it. When it cannot (a full
+    disk, a closed descriptor) there is nobody to tell: the exit code 2 still
+    says "could not run", and it must not become a traceback with 1, which
+    means "a case failed"."""
+    try:
+        print(message, file=sys.stderr)
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
 
 
 if __name__ == "__main__":

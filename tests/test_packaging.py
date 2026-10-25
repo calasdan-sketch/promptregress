@@ -51,9 +51,14 @@ class TestPythonVersionClaims(unittest.TestCase):
         self.assertEqual(min(classified), floor,
                          f"requires-python floor {show({floor})} vs "
                          f"classifiers {show(classified)}")
-        self.assertEqual(classified, in_ci,
-                         f"classifiers {show(classified)} vs "
-                         f"CI {show(in_ci)}")
+        # CI tests the oldest and the newest classified Python, and some
+        # in between; every version it runs is classified
+        self.assertLessEqual(in_ci, classified,
+                             f"CI runs {show(in_ci)}, classifiers say "
+                             f"{show(classified)}")
+        self.assertIn(floor, in_ci, "CI must run the oldest Python")
+        self.assertIn(max(classified), in_ci,
+                      "CI must run the newest classified Python")
         m = re.search(r"Python (3\.\d+)\+", readme)
         self.assertTrue(m, 'README needs a "Python 3.N+" install claim')
         self.assertEqual(min(versions(m.group(1))), floor,

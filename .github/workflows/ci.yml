@@ -1,11 +1,17 @@
-# Test suite for promptregress itself: install the package, run the tests.
-# Stdlib only, so there is nothing else to install; the tests talk to an
-# in-process fake model, so no API key or network is needed.
+# Test suite for promptregress itself: install the package, run the tests, on every
+# supported system and on the oldest, a middle and the newest Python. Stdlib
+# only, so there is nothing else to install; the tests talk to an in-process fake model, so no API key or network is needed.
+# A second job builds the distribution, checks its metadata and installs the
+# wheel the way a user would.
 name: ci
 
 on:
   push:
   pull_request:
+
+# The tests only read the repository: the token gets no more than that.
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -15,12 +21,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python: ["3.11", "3.12", "3.13"]
-        include:
-          # requires-python is >=3.10: check that floor once, on the
-          # cheapest runner, instead of on all three systems.
-          - os: ubuntu-latest
-            python: "3.10"
+        python: ["3.10", "3.12", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -32,3 +33,23 @@ jobs:
         run: python -m unittest discover -s tests
       - name: Smoke-test the console script
         run: promptregress --demo run --prompt sentiment --version v1
+
+  package:
+    name: build, twine check, install the wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build
+        run: |
+          python -m pip install build twine
+          python -m build
+      - name: Check the metadata
+        run: twine check --strict dist/*
+      - name: Install the wheel in a clean environment and run it
+        run: |
+          python -m venv "$RUNNER_TEMP/wheel-venv"
+          "$RUNNER_TEMP/wheel-venv/bin/pip" install dist/*.whl
+          "$RUNNER_TEMP/wheel-venv/bin/promptregress" --demo run --prompt sentiment --version v1

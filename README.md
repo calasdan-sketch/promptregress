@@ -40,6 +40,12 @@ Exit code 1, so CI blocks the merge. (Both outputs above are what
 Zero dependencies — Python 3.10+ stdlib only.
 
 ```bash
+pip install promptregress
+```
+
+From source (the latest, unreleased code):
+
+```bash
 pip install git+https://github.com/calasdan-sketch/promptregress
 ```
 
@@ -217,6 +223,14 @@ assertion fails that case with `bad assertion: ...`, it never crashes the run.
   have (`str`, `int`: write `string`, `integer`). The annotations `title`,
   `description`, `$schema`, `default` and `examples` are accepted and
   ignored.
+- What the checks are, exactly: `json_valid` and `schema` read strict JSON
+  (`NaN` and `Infinity` are refused as Python extensions) and a duplicate key
+  in an object is not an error (the last one wins, as in Python);
+  `type: integer` accepts `1.0` (JSON Schema does too). `regex` is Python's
+  `re.search`: `$` also matches before a final newline (`^neg$` finds
+  `neg\n`; use `\Z` for the very end), and your pattern runs with no time
+  limit, so a pattern like `(a+)+$` against a long reply can take very long.
+  Write patterns you would trust on any input.
 - `max_tokens` / `min_tokens` use a rough estimate of one token per 4
   characters - a guardrail, not a tokenizer. An empty or blank reply is 0
   tokens, so `min_tokens: 1` fails it.
@@ -240,6 +254,10 @@ Zero dependencies — plain stdlib HTTP against any OpenAI-compatible API:
 | `PROMPTREGRESS_MODEL` | `llama3.1` | |
 | `PROMPTREGRESS_TIMEOUT` | `60` | seconds for one request, from connecting to the last byte of the reply: a deadline, however slowly the server sends |
 | `PROMPTREGRESS_MAX_REPLY_BYTES` | `8388608` | the largest reply body accepted (8 MiB); a bigger one is an error and is never read into memory |
+
+`--base-url` must be an `http://` or `https://` address with a host and
+without a user name or password (`file:`, `ftp:` and `data:` addresses are
+refused with exit 2; the key belongs in `PROMPTREGRESS_API_KEY`).
 
 Flags `--model`, `--base-url`, `--api-key`, `--timeout`, `--max-reply-bytes`
 (and `--demo`) override env; they are accepted before or after the subcommand
@@ -361,8 +379,10 @@ in the file).
 
 This repo's own CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml))
 installs the package and runs the test suite on Ubuntu, Windows and macOS
-with Python 3.11, 3.12 and 3.13, plus Python 3.10 (the oldest supported)
-on Ubuntu.
+with Python 3.10 (the oldest supported), 3.12 and 3.14 (the newest); a
+second job builds the package, runs `twine check --strict` and installs the
+wheel in a clean environment. Pushing a `v*` tag publishes to PyPI
+([`release.yml`](.github/workflows/release.yml)).
 
 ## Limitations
 

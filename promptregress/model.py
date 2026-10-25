@@ -171,17 +171,58 @@ def resolve_max_reply_bytes(limit=None) -> int:
                     "max_reply_bytes")
 
 
+def _without_userinfo(url: str) -> str:
+    """`url` with any user:password@ cut out, so an error message can show
+    what was typed without repeating a secret."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if parts.username is None and parts.password is None \
+                and "@" not in parts.netloc:
+            return url[:200]
+        host = parts.netloc.rpartition("@")[2]
+        return urllib.parse.urlunsplit(parts._replace(netloc=host))[:200]
+    except ValueError:
+        return "<unreadable URL>"
+
+
+def check_base_url(url: str) -> str:
+    """`url` if it is an http(s) address with a host and no credentials,
+    else a ValueError that says what to do. urllib would also serve file:,
+    ftp: and data: (a crash or a read of the local disk), and would send a
+    user:password@ part to the wrong host and echo it back in errors."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host, _ = parts.hostname, parts.port
+    except ValueError:
+        raise ValueError(
+            f"--base-url {_without_userinfo(url)!r} is not a valid URL "
+            "(expected http://host[:port]/v1)") from None
+    if parts.scheme.lower() not in ("http", "https") or not host:
+        raise ValueError(
+            f"--base-url {_without_userinfo(url)!r} must be an http:// or "
+            "https:// address, such as http://localhost:11434/v1")
+    if "@" in parts.netloc:
+        raise ValueError(
+            f"--base-url {_without_userinfo(url)!r} must not carry a "
+            "user name or password; put the key in PROMPTREGRESS_API_KEY")
+    return url
+
+
 def endpoint(base_url=None, model=None) -> tuple[str, str]:
     """(model, base_url) with the environment's defaults applied: who will
-    answer."""
+    answer. A base URL that is not a plain http(s) address is a ValueError."""
+    url = (base_url or os.environ.get("PROMPTREGRESS_BASE_URL")
+           or "http://localhost:11434/v1").rstrip("/")
     return (model or os.environ.get("PROMPTREGRESS_MODEL") or "llama3.1",
-            (base_url or os.environ.get("PROMPTREGRESS_BASE_URL")
-             or "http://localhost:11434/v1").rstrip("/"))
+            check_base_url(url))
 
 
 def _cfg(base_url=None, api_key=None, model=None, timeout=None,
          max_reply_bytes=None):
-    model, base_url = endpoint(base_url, model)
+    try:
+        model, base_url = endpoint(base_url, model)
+    except ValueError as e:
+        raise ModelError(str(e)) from None
     return {
         "base_url": base_url,
         "api_key": resolve_api_key(api_key),
@@ -489,7 +530,14 @@ def _complete(prompt: str, cfg: dict, temperature: float, gate: _Gate) -> str:
     handlers = [_NoRedirects, _HTTP(gate)]
     if hasattr(urllib.request, "HTTPSHandler"):
         handlers.append(_HTTPS(gate))
-    opener = urllib.request.build_opener(*handlers)
+    # Not build_opener(): its defaults would also serve file:, ftp: and data:
+    opener = urllib.request.OpenerDirector()
+    for handler in (urllib.request.ProxyHandler(),
+                    urllib.request.UnknownHandler(),
+                    urllib.request.HTTPDefaultErrorHandler(),
+                    urllib.request.HTTPErrorProcessor(), *handlers):
+        opener.add_handler(handler() if isinstance(handler, type)
+                           else handler)
     try:
         with opener.open(req, timeout=timeout) as resp:
             raw = _read_capped(resp, cfg)
