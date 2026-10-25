@@ -243,6 +243,74 @@ assert:
       rubric: "Output must be exactly one word: positive, negative, or neutral."
 ```
 
+## Faster runs, reports for CI, pytest, and the guard
+
+**`--jobs N`** (on `run` and `diff`) sends N requests at once: `promptregress
+run --all --jobs 4`. The default is 1 and the most is 64. Results are listed
+in case order whatever order the answers came in, so the report is the same
+as with `--jobs 1`; when the model cannot answer a case the run stops at the
+first such case in that order, as before (cases already in flight past it
+are dropped). Local servers such as Ollama often answer one request at a
+time anyway; hosted APIs have rate limits, and the tool does not slow itself
+down for them.
+
+**`run --format junit`** writes JUnit XML to stdout (one test suite per
+prompt version, one test case per case, a `<failure>` for each failing case),
+which CI systems show as a test report:
+
+```bash
+promptregress run --all --format junit > promptregress.xml
+```
+
+**`run --format sarif`** writes a SARIF 2.1.0 log, one result per failed
+assertion, at the case's line in its cases file, for GitHub code scanning
+(`github/codeql-action/upload-sarif`). Both formats exit 1 when a case failed,
+like the human report. Model text XML cannot hold (control characters) is
+replaced by U+FFFD.
+
+**pytest.** With pytest installed (`pip install "promptregress[pytest]"`),
+every golden case is a normal test:
+
+```bash
+pytest --promptregress                        # the latest version of each prompt
+pytest --promptregress --promptregress-version all
+pytest --promptregress --promptregress-demo   # the built-in fake model
+```
+
+Test ids look like `prompts/sentiment.cases.yaml::v2::angry review`. The model
+comes from the same `PROMPTREGRESS_*` environment variables (or
+`--promptregress-model`, `--promptregress-base-url`,
+`--promptregress-timeout`; the key only from `PROMPTREGRESS_API_KEY`). pytest
+finds the plugin by itself, but it does nothing without `--promptregress`:
+the cases call the model, which can cost money, so they never run by
+surprise. After the first case the model cannot answer, the remaining cases
+are skipped. pytest 7 or later. The plugin is the module
+`promptregress.pytest`; an installed promptregress registers it itself, so do
+not also pass `-p promptregress.pytest` (pytest refuses to load it twice). Only
+from a source checkout that is not installed is `-p promptregress.pytest`
+needed.
+
+**`promptregress guard`** fails when a prompt changed but nothing that
+checks it did:
+
+```bash
+promptregress guard --since origin/main
+promptregress guard --changed-files prompts/sentiment.v2.txt,README.md
+```
+
+A prompt file is `prompts/NAME.vN.txt`; the cases that check it are in
+`prompts/NAME.cases.yaml`. If a prompt file is changed (or is new) and its
+cases file is not, `guard` exits 1 and names both files. Cases changed without
+a prompt change are fine, and so are all other files. The changed files come
+from `--changed-files` (commas or newlines; paths relative to `--root`) or
+from git: `--since REF` (default `HEAD`: your uncommitted changes and new
+files) lists what differs from that ref, deleted files not counted. In a pull
+request check `--since "$(git merge-base origin/main HEAD)"` out with
+`fetch-depth: 0`. `guard` runs no model and needs no key. Exit 0 ok, 1 a
+prompt changed alone, 2 it could not tell (not a git repository, unknown ref).
+The guard checks that the cases file was touched, not that the new case is a
+good one.
+
 ## Model endpoint
 
 Zero dependencies — plain stdlib HTTP against any OpenAI-compatible API:
@@ -350,7 +418,7 @@ The same for the human report and `--format json`:
 | Code | Meaning |
 |---|---|
 | `0` | `run`: every case passed. `list`, `init`: done. `diff`: the comparison was made, whatever it shows |
-| `1` | `run`: at least one case failed |
+| `1` | `run`: at least one case failed. `diff --fail-on-flip`: a case went from pass to FAIL. `guard`: a prompt changed without its cases |
 | `2` | usage or configuration error, nothing judged: a prompt or cases file that is missing or malformed; a cases file with no cases (`case:` typed for `cases:`, `cases: []`, an empty file) or with a case or an assertion that cannot be used (see "Checked before anything runs"); a file that cannot be read or written (a prompt file you may not open; `init` in a read-only folder); an API key that cannot be sent (see Model endpoint); a model that cannot be used (unreachable, rejecting the call, redirecting). `list` exits 2 too when a cases file is invalid or unreadable. A response cache that cannot be written is not an error (see Caching) |
 
 A suite with nothing in it never passes: a CI job that ran no cases would
@@ -359,8 +427,10 @@ be green and test nothing.
 `diff` reports, it does not judge: it exits 0 whenever the comparison was
 made, flipped verdicts included - the example at the top of this page exits
 0 though a case regressed, because a flip can be a fix as well as a
-regression. Gate a build with `run` (or `run --all`); to act on a flip, read
-`changed` per case in `diff --format json`.
+regression. Gate a build with `run` (or `run --all`), or ask `diff` itself
+to judge with `--fail-on-flip`: it then exits 1 when a case went from pass to
+FAIL (a case that went from FAIL to pass never fails it). `diff --format json`
+has `changed` and `regressed` per case and `regressions` in total.
 
 Piping is safe: when the reader quits early (`promptregress run --all |
 head -5`) the output just stops, with no traceback, and the exit code is
@@ -403,9 +473,11 @@ What this tool does not do, so you do not find out the hard way:
 - `schema` is a mini validator and the cases file is read by a YAML subset
   parser. What they do not understand is refused with an error, never
   ignored.
-- Requests run one after the other; there is no parallel mode.
-- `diff` shows flipped verdicts but exits 0 (see Exit codes); `run` is what
-  fails a build.
+- Requests run one after the other unless you ask for more with `--jobs`;
+  it has no rate limiting of its own, so keep N within what your server and
+  your account allow.
+- `diff` shows flipped verdicts but exits 0 unless you pass `--fail-on-flip`
+  (see Exit codes); `run` is what fails a build.
 
 ## Why not Langfuse / LangSmith / Braintrust?
 

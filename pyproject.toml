@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "promptregress"
-version = "0.1.5"
+version = "0.2.0"
 description = "Pytest for prompts: catch LLM regressions before your users do."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -32,8 +32,17 @@ Homepage = "https://github.com/calasdan-sketch/promptregress"
 Repository = "https://github.com/calasdan-sketch/promptregress"
 Issues = "https://github.com/calasdan-sketch/promptregress/issues"
 
+[project.optional-dependencies]
+# Only for `pytest --promptregress` (promptregress.pytest); the tool itself
+# needs nothing.
+pytest = ["pytest>=7.0"]
+
 [project.scripts]
 promptregress = "promptregress.cli:main"
+
+# pytest finds the plugin by itself; it does nothing without --promptregress.
+[project.entry-points.pytest11]
+promptregress = "promptregress.pytest"
 
 [tool.setuptools]
 packages = ["promptregress"]

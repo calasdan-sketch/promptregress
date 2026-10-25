@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.0
+
+- `diff --fail-on-flip`: exit 1 when a case that passed with the first
+  version fails with the second. A case that went from FAIL to pass is a fix
+  and never fails the command. `diff --format json` gets `regressed` per case
+  and `regressions` in total.
+- `--jobs N` on `run` and `diff`: send N model requests at once (default 1,
+  at most 64). The report is the same as with 1 and in case order; a model
+  error still stops the run at the first failing case in that order.
+- `run --format junit` (JUnit XML for CI test reports; model text that XML
+  cannot hold is replaced, the file is plain ASCII) and `run --format sarif`
+  (SARIF 2.1.0 for GitHub code scanning, one result per failed assertion,
+  located at the case in its cases file).
+- A pytest plugin, `promptregress.pytest`: `pytest --promptregress` runs the
+  golden cases as normal tests. pytest is optional (`pip install
+  "promptregress[pytest]"`); the plugin does nothing without
+  `--promptregress`, because the cases call the model.
+- `promptregress guard`: fails when a prompt file changed but its cases file
+  did not (`--changed-files a,b` or `--since REF`).
+- The built-in fake model serves requests on several threads.
+
 ## 0.1.5
 
 - A report or an error line that cannot be written (`> /dev/full`,

@@ -8,6 +8,7 @@ diff versions A/B, and catch prompt drift before your users do.
   python3 -m promptregress run --all            # every prompt x every version
   python3 -m promptregress diff v1 v2 --prompt sentiment
   python3 -m promptregress list
+  python3 -m promptregress guard --since origin/main   # prompt changed, cases too?
 
 (--demo trials the suite against a built-in fake model; after
 `pip install .` the `promptregress` command is on your PATH.)
@@ -18,7 +19,9 @@ that is missing or unusable (no cases, an assertion that does not exist ...),
 a file that cannot be read or written (`init` in a read-only folder), an API
 key that cannot be sent, a model that cannot be used. `diff` only reports: it
 exits 0 whenever the comparison was made, whether or not verdicts flipped (a
-flip can be a fix as well as a regression; gate builds with `run`). A response
+flip can be a fix as well as a regression; gate builds with `run`, or ask
+`diff --fail-on-flip` to exit 1 when a case went from pass to fail). `guard`
+exits 1 when a prompt file changed without its cases file. A response
 cache that cannot be written is no error: it is skipped, with one warning.
 """
 
@@ -33,11 +36,13 @@ import sys
 import tempfile
 
 from . import demo as demo_mod
+from . import guard as guard_mod
 from . import model as model_mod
+from . import report as report_mod
 from . import runner as runner_mod
 from . import suite as suite_mod
 
-VERSION = "0.1.5"
+VERSION = "0.2.0"
 
 
 def _harden_streams() -> None:
@@ -364,7 +369,7 @@ def _run_or_error(root, name, version, args, cases=None):
     try:
         results, _ = runner_mod.run_suite(
             root, name, version, cases=cases, model_kw=_model_kw(args),
-            use_cache=_use_cache(args))
+            use_cache=_use_cache(args), jobs=getattr(args, "jobs", 1))
     except (OSError, ValueError) as e:
         print(f"error: {runner_mod.error_text(e)}", file=sys.stderr)
         return None, 2
@@ -401,6 +406,12 @@ def cmd_run(args) -> int:
         if results is None:
             return rc
         suites.append((name, version, results))
+    if args.format in ("junit", "sarif"):
+        if args.format == "junit":
+            print(report_mod.junit_xml(suites), end="")
+        else:
+            print(report_mod.sarif_text(suites, VERSION, root), end="")
+        return 0 if all(x.passed for _, _, r in suites for x in r) else 1
     if args.format == "json":
         if not args.all:
             name, version, results = suites[0]
@@ -449,14 +460,19 @@ def cmd_diff(args) -> int:
             "v1": "pass" if a.passed else "FAIL",
             "v2": "pass" if b.passed else "FAIL",
             "changed": a.passed != b.passed,
+            "regressed": a.passed and not b.passed,
             # before/after output text on flips (truncated like run's)
             "v1_output": a.output[:300],
             "v2_output": b.output[:300],
         })
+    regressed = [r for r in rows if r["regressed"]]
+    # 1 only when asked to judge, and only for a pass that became a FAIL
+    rc = 1 if args.fail_on_flip and regressed else 0
     if args.format == "json":
         print(json.dumps({"prompt": args.prompt, "v1": args.v1,
-                          "v2": args.v2, "cases": rows}, indent=2))
-        return 0
+                          "v2": args.v2, "cases": rows,
+                          "regressions": len(regressed)}, indent=2))
+        return rc
     w = max([len(r["name"]) for r in rows] + [4])
     print(f"{'case':<{w}}  {args.v1:>6}  {args.v2:>6}")
     for r in rows:
@@ -469,7 +485,51 @@ def cmd_diff(args) -> int:
         print(f"  {args.v2} output: {r['v2_output']!r}")
     print(f"\n{len(flipped)}/{len(rows)} case(s) changed verdict "
           f"{args.v1} -> {args.v2}")
-    return 0
+    if args.fail_on_flip:
+        if regressed:
+            print(f"{len(regressed)} case(s) went from pass to FAIL "
+                  f"({args.v1} -> {args.v2}): failing, as --fail-on-flip "
+                  "asked")
+        else:
+            print("no case went from pass to FAIL")
+    return rc
+
+
+def cmd_guard(args) -> int:
+    changed_given = args.changed_files is not None
+    if changed_given and args.since is not None:
+        print("error: give --changed-files or --since, not both",
+              file=sys.stderr)
+        return 2
+    try:
+        if changed_given:
+            changed = guard_mod.split_changed(args.changed_files)
+        else:
+            changed = guard_mod.git_changed(args.root, args.since or "HEAD")
+    except guard_mod.GuardError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    def cases_exist(name):
+        return os.path.isfile(os.path.join(
+            args.root, suite_mod.PROMPTS_DIR, f"{name}.cases.yaml"))
+
+    problems = guard_mod.check(changed, cases_exist)
+    if args.format == "json":
+        print(json.dumps({"changed_files": len(changed), "ok": not problems,
+                          "problems": problems}, indent=2))
+        return 1 if problems else 0
+    if not problems:
+        print(f"ok: no prompt changed without its cases "
+              f"({len(changed)} changed file(s) looked at)")
+        return 0
+    print(f"{len(problems)} prompt file(s) changed without their cases:\n")
+    for p in problems:
+        print(f"  {p['prompt_file']} changed, but {p['cases_file']} did not"
+              + ("" if p["cases_exist"] else " (and does not exist yet)"))
+    print("\nAdd or update a case that exercises the new wording, in the "
+          "cases file named above.")
+    return 1
 
 
 def _flag(parse):
@@ -518,6 +578,27 @@ def _add_model_options(p: argparse.ArgumentParser, *, on_subcommand: bool) -> No
                         "prompt is missing.")
 
 
+def _jobs(text):
+    try:
+        n = int(text)
+    except ValueError:
+        n = 0
+    if not 1 <= n <= runner_mod.MAX_JOBS:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a number of requests between 1 and "
+            f"{runner_mod.MAX_JOBS}")
+    return n
+
+
+def _add_jobs_option(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--jobs", "-j", type=_jobs, default=1, metavar="N",
+                   help=f"Send N model requests at once (1 to "
+                        f"{runner_mod.MAX_JOBS}; default 1). The report "
+                        f"reads the same as with 1, in case order. Raise it "
+                        f"only as far as your model server and its rate "
+                        f"limit allow.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="promptregress", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -540,7 +621,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Run every prompt against each of its versions and "
                         "print a summary table; exit 1 if any case fails.")
     r.add_argument("--no-cache", action="store_true")
-    r.add_argument("--format", choices=["human", "json"], default="human")
+    r.add_argument("--format", choices=["human", "json", "junit", "sarif"],
+                   default="human",
+                   help="human text (default), JSON, JUnit XML for CI test "
+                        "reports, or a SARIF 2.1.0 log of the failures.")
+    _add_jobs_option(r)
     _add_model_options(r, on_subcommand=True)
 
     d = sub.add_parser(
@@ -558,7 +643,31 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--prompt", required=True)
     d.add_argument("--no-cache", action="store_true")
     d.add_argument("--format", choices=["human", "json"], default="human")
+    d.add_argument("--fail-on-flip", action="store_true",
+                   help="Exit 1 when a case that passed with v1 fails with "
+                        "v2 (a regression). A case that went from FAIL to "
+                        "pass is a fix and never fails the command.")
+    _add_jobs_option(d)
     _add_model_options(d, on_subcommand=True)
+
+    g = sub.add_parser(
+        "guard", help="Fail if a prompt file changed but its cases file "
+                      "did not.",
+        description="Fail when a prompt file (prompts/NAME.vN.txt) changed "
+                    "and its cases file (prompts/NAME.cases.yaml) did not: "
+                    "a reworded prompt should come with a case that checks "
+                    "the new wording. Runs no model. Give the changed files "
+                    "with --changed-files, or let git list them (--since, "
+                    "default HEAD: everything changed or new in the working "
+                    "tree). Exit 0 ok, 1 a prompt changed alone, 2 could "
+                    "not tell.")
+    g.add_argument("--changed-files", action="append", metavar="A,B",
+                   help="Changed files, relative to --root, separated by "
+                        "commas or newlines (repeatable).")
+    g.add_argument("--since", metavar="REF", default=None,
+                   help="Ask git: files changed against this ref (and new "
+                        "files). Default HEAD.")
+    g.add_argument("--format", choices=["human", "json"], default="human")
     return p
 
 
@@ -624,7 +733,8 @@ def _run(argv, stack, reported) -> int:
     runner_mod.reset_cache_warnings()
     try:
         return {"init": cmd_init, "list": cmd_list,
-                "run": cmd_run, "diff": cmd_diff}[args.cmd](args)
+                "run": cmd_run, "diff": cmd_diff,
+                "guard": cmd_guard}[args.cmd](args)
     except OSError as e:
         # whatever file trouble nothing above handled (an unreadable
         # prompts folder ...): one line and exit 2, never a traceback

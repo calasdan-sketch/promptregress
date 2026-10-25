@@ -16,6 +16,9 @@ import hashlib
 import json
 import os
 import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 from . import asserts as asserts_mod
 from . import model as model_mod
@@ -68,6 +71,7 @@ class CaseResult:
     assertions: list[AssertionResult]
     cached: bool = False
     error: str = ""
+    seconds: float = 0.0   # wall time of the case (reports only)
 
     def as_dict(self) -> dict:
         return {
@@ -102,6 +106,9 @@ def _cache_read(root: str, key: str) -> dict | None:
 #: failure of a command prints one warning and ends that root's cache
 #: writes; cli.main() empties this at the start of every command.
 _cache_off: dict[str, str] = {}
+#: Cases may run on several threads (--jobs): one lock for the cache's
+#: first-failure bookkeeping, so the warning is printed once.
+_cache_lock = threading.Lock()
 
 
 def reset_cache_warnings() -> None:
@@ -123,14 +130,18 @@ def _cache_write(root: str, key: str, payload: dict) -> bool:
         return False
     p = _cache_path(root, key)
     try:
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        ensure_cache_ignored(root)
+        with _cache_lock:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            ensure_cache_ignored(root)
         with open(p, "w", encoding="utf-8") as f:
             json.dump(payload, f)
     except OSError as e:
-        why = _cache_off[root] = error_text(e)
-        print(f"warning: cache disabled: cannot write {why} "
-              "(the run goes on without it)", file=sys.stderr)
+        with _cache_lock:
+            if root in _cache_off:
+                return False
+            why = _cache_off[root] = error_text(e)
+            print(f"warning: cache disabled: cannot write {why} "
+                  "(the run goes on without it)", file=sys.stderr)
         return False
     return True
 
@@ -157,6 +168,16 @@ def _judge_key(prompt_name: str, version: str, case_name: str,
 def run_case(root: str, prompt_name: str, version: str, prompt_text: str,
              case: dict, model_kw: dict, use_cache: bool = True,
              judge_model_kw: dict | None = None) -> CaseResult:
+    started = time.perf_counter()
+    result = _run_case(root, prompt_name, version, prompt_text, case,
+                       model_kw, use_cache, judge_model_kw)
+    result.seconds = time.perf_counter() - started
+    return result
+
+
+def _run_case(root: str, prompt_name: str, version: str, prompt_text: str,
+              case: dict, model_kw: dict, use_cache: bool = True,
+              judge_model_kw: dict | None = None) -> CaseResult:
     model_name, base_url = _provider(model_kw)
     key = suite_mod.cache_key(prompt_name, version, prompt_text, case,
                               model_name, base_url)
@@ -227,11 +248,16 @@ def _warn_about_template(root: str, prompt_name: str, version: str,
         print(f"warning: {path}: {problem}", file=sys.stderr)
 
 
+#: The most cases run at once: more is a typo, or a way to flatten a server.
+MAX_JOBS = 64
+
+
 def run_suite(root: str, prompt_name: str, version: str,
               cases: list[dict] | None = None,
               model_kw: dict | None = None,
               use_cache: bool = True,
-              fail_fast: bool = True) -> tuple[list[CaseResult], str]:
+              fail_fast: bool = True,
+              jobs: int = 1) -> tuple[list[CaseResult], str]:
     """Run every case of prompt_name against `version`.
 
     fail_fast (default): the first case the model could not answer
@@ -239,16 +265,44 @@ def run_suite(root: str, prompt_name: str, version: str,
     cases would only repeat the same error, each paying the timeout
     again. The returned list is then shorter than the case list; its
     last entry carries the error.
+
+    jobs > 1 sends that many requests at once (a thread pool). The results
+    come back in case order whatever order the answers arrived in, and
+    fail_fast cuts at the first failing case in case order, so a run reads
+    the same as one with jobs=1: cases that were already in flight past
+    that point are dropped from the list.
     """
     prompt_text = suite_mod.load_prompt(root, prompt_name, version)
     cases = cases if cases is not None else suite_mod.load_cases(root,
                                                                  prompt_name)
     _warn_about_template(root, prompt_name, version, prompt_text, cases)
-    results = []
-    for c in cases:
-        r = run_case(root, prompt_name, version, prompt_text, c,
-                     model_kw or {}, use_cache)
-        results.append(r)
-        if fail_fast and r.error:
-            break
+    if not 1 <= jobs <= MAX_JOBS:
+        raise ValueError(f"jobs must be between 1 and {MAX_JOBS}, "
+                         f"got {jobs}")
+    kw = model_kw or {}
+    results: list[CaseResult] = []
+    if jobs == 1 or len(cases) < 2:
+        for c in cases:
+            r = run_case(root, prompt_name, version, prompt_text, c, kw,
+                         use_cache)
+            results.append(r)
+            if fail_fast and r.error:
+                break
+        return results, prompt_text
+    pool = ThreadPoolExecutor(max_workers=min(jobs, len(cases)),
+                              thread_name_prefix="promptregress-case")
+    try:
+        futures = [pool.submit(run_case, root, prompt_name, version,
+                               prompt_text, c, kw, use_cache)
+                   for c in cases]
+        for future in futures:
+            r = future.result()
+            results.append(r)
+            if fail_fast and r.error:
+                break
+    except BaseException:
+        # Ctrl-C or a bug: do not sit through the requests still in flight
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    pool.shutdown(wait=True, cancel_futures=True)
     return results, prompt_text
