@@ -56,7 +56,14 @@ _FLOAT_RE = re.compile(r"[-+]?(?:[0-9]+\.[0-9]*|\.[0-9]+|[0-9]+(?=[eE]))"
 MAX_DEPTH = 50
 
 
+#: The longest message kept whole: a hostile or generated line of thousands of
+#: characters is shown by its start, not echoed in full.
+MAX_MESSAGE = 240
+
+
 def _err(msg: str, lineno: int) -> ValueError:
+    if len(msg) > MAX_MESSAGE:
+        msg = f"{msg[:MAX_MESSAGE - 40]}... ({len(msg)} characters in all)"
     return ValueError(f"miniyaml: {msg} (line {lineno})")
 
 

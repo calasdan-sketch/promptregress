@@ -15,7 +15,7 @@ Maps prompt substrings -> canned responses. Run in a thread:
 
 import json
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -52,7 +52,9 @@ class _Handler(BaseHTTPRequestHandler):
 
 def start_fake_model(routes: dict[str, str], default: str = "ok"):
     handler = type("H", (_Handler,), {"routes": routes, "default": default})
-    server = HTTPServer(("127.0.0.1", 0), handler)
+    # one thread per request, so `--jobs` can ask for several at once
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server.daemon_threads = True
     url = f"http://127.0.0.1:{server.server_port}/v1"
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

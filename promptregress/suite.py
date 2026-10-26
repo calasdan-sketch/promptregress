@@ -113,7 +113,9 @@ def template_problems(template: str, cases: list[dict]) -> list[str]:
     return problems
 
 
-CASE_KEYS = ("name", "input", "vars", "assert")
+CASE_KEYS = ("name", "input", "vars", "assert", "samples", "min_pass_rate")
+#: Most samples one case may ask for: each is a model request.
+MAX_SAMPLES = 50
 #: At most this many problems are listed, so a file that is wrong everywhere
 #: does not flood a CI log.
 MAX_PROBLEMS = 20
@@ -187,8 +189,30 @@ def _check_case(case: dict, index: int) -> tuple[dict, str, list[str]]:
                     checked.append(asserts.check(item))
                 except ValueError as e:
                     problems.append(f"assert[{j}]: {e}")
-    return ({"name": name, "input": text, "vars": variables,
-             "assert": checked}, label, problems)
+    working = {"name": name, "input": text, "vars": variables,
+               "assert": checked}
+    samples = case.get("samples")
+    if "samples" in case:
+        if (isinstance(samples, bool) or not isinstance(samples, int)
+                or not 1 <= samples <= MAX_SAMPLES):
+            problems.append(f"samples: needs a whole number from 1 to "
+                            f"{MAX_SAMPLES}, got {asserts.describe(samples)}")
+        elif samples > 1:
+            working["samples"] = samples
+    rate = case.get("min_pass_rate")
+    if "min_pass_rate" in case:
+        if (isinstance(rate, bool) or not isinstance(rate, (int, float))
+                or not 0 < rate <= 1):
+            problems.append("min_pass_rate: needs a number above 0 and at "
+                            f"most 1 (0.8 = 8 samples in 10 must pass), got "
+                            f"{asserts.describe(rate)}")
+        elif not (isinstance(samples, int) and not isinstance(samples, bool)
+                  and samples > 1):
+            problems.append("min_pass_rate: only means something with "
+                            "samples: 2 or more")
+        else:
+            working["min_pass_rate"] = float(rate)
+    return (working, label, problems)
 
 
 def load_cases(root: str, name: str,

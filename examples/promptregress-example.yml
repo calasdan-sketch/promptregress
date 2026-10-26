@@ -24,7 +24,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install promptregress (stdlib only, no other dependencies)
-        run: pip install git+https://github.com/calasdan-sketch/promptregress
+        run: pip install promptregress
       - name: Prompt regression tests (demo mode, fake model)
         run: promptregress --demo run --prompt sentiment --version v1
       # Real model instead of the demo: every prompt x every version in one
@@ -37,3 +37,7 @@ jobs:
       #     PROMPTREGRESS_API_KEY: ${{ secrets.PROMPTREGRESS_API_KEY }}
       #     PROMPTREGRESS_MODEL: llama3.1
       #   run: promptregress run --all --no-cache --timeout 60
+      # Fail a pull request that rewords a prompt without touching its cases
+      # (needs the whole history: set `fetch-depth: 0` on actions/checkout):
+      # - name: A changed prompt needs a changed case
+      #   run: promptregress guard --since "$(git merge-base origin/${{ github.base_ref }} HEAD)"

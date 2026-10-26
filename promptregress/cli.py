@@ -8,6 +8,7 @@ diff versions A/B, and catch prompt drift before your users do.
   python3 -m promptregress run --all            # every prompt x every version
   python3 -m promptregress diff v1 v2 --prompt sentiment
   python3 -m promptregress list
+  python3 -m promptregress guard --since origin/main   # prompt changed, cases too?
 
 (--demo trials the suite against a built-in fake model; after
 `pip install .` the `promptregress` command is on your PATH.)
@@ -18,7 +19,9 @@ that is missing or unusable (no cases, an assertion that does not exist ...),
 a file that cannot be read or written (`init` in a read-only folder), an API
 key that cannot be sent, a model that cannot be used. `diff` only reports: it
 exits 0 whenever the comparison was made, whether or not verdicts flipped (a
-flip can be a fix as well as a regression; gate builds with `run`). A response
+flip can be a fix as well as a regression; gate builds with `run`, or ask
+`diff --fail-on-flip` to exit 1 when a case went from pass to fail). `guard`
+exits 1 when a prompt file changed without its cases file. A response
 cache that cannot be written is no error: it is skipped, with one warning.
 """
 
@@ -32,12 +35,15 @@ import os
 import sys
 import tempfile
 
+from . import __version__
 from . import demo as demo_mod
+from . import guard as guard_mod
 from . import model as model_mod
+from . import report as report_mod
 from . import runner as runner_mod
 from . import suite as suite_mod
 
-VERSION = "0.1.3"
+VERSION = __version__
 
 
 def _harden_streams() -> None:
@@ -132,36 +138,91 @@ class _PipeSafe:
         return getattr(self._stream, name)
 
 
+class _StreamState:
+    """What happened to the output streams while main() ran."""
+
+    def __init__(self):
+        self.write_error = None   # the OSError that stopped the output
+
+
 @contextlib.contextmanager
 def _closed_pipe_tolerant():
-    """Run the body with stdout and stderr wrapped in _PipeSafe."""
+    """Run the body with stdout and stderr wrapped in _PipeSafe. Yields a
+    _StreamState; a stream that cannot take its output (a full disk, `>
+    /dev/full`) is recorded there, never raised, because this runs after
+    the command: a traceback here would replace its exit code with 120."""
+    state = _StreamState()
     real = (sys.stdout, sys.stderr)  # either is None under pythonw
     safe = tuple(_PipeSafe(s) if s is not None else None for s in real)
     sys.stdout, sys.stderr = safe
     try:
-        yield
+        yield state
     finally:
-        try:
-            # Flush now, with the command done, while a closed pipe is
-            # still handled. A small output only ever sits in the buffer,
-            # so nothing has failed yet; left to the interpreter's flush
-            # at exit, the error would be "Exception ignored" and the exit
-            # code 120 instead of the command's own.
-            for s in safe:
-                if s is not None:
-                    s.flush()
-        finally:
-            sys.stdout, sys.stderr = real
+        # Flush now, with the command done, while a closed pipe is still
+        # handled. A small output only ever sits in the buffer, so nothing
+        # has failed yet; left to the interpreter's flush at exit, the
+        # error would be "Exception ignored" and the exit code 120 instead
+        # of the command's own.
+        for s, raw in zip(safe, real):
+            if s is None:
+                continue
+            try:
+                s.flush()
+            except (OSError, ValueError) as e:
+                if state.write_error is None:
+                    state.write_error = e
+                # what is left in the buffer must not fail again at exit
+                _discard_output(raw)
+        sys.stdout, sys.stderr = real
 
 
 def _model_kw(args) -> dict:
     kw: dict = {}
     for name in ("model", "base_url", "api_key", "timeout",
-                 "max_reply_bytes"):
+                 "max_reply_bytes", "retries"):
         val = getattr(args, name, None)
         if val is not None:
             kw[name] = val
+    if getattr(args, "insecure_http", None):
+        kw["insecure_http"] = True
     return kw
+
+
+def _judge_kw(args) -> dict | None:
+    """The judge's own endpoint: --judge-model / --judge-base-url /
+    --judge-api-key (env PROMPTREGRESS_JUDGE_MODEL / _BASE_URL / _API_KEY),
+    everything else as for the model under test. None when none is given: the
+    judge is then the same model."""
+    given = {}
+    for flag, env, name in (("judge_model", "PROMPTREGRESS_JUDGE_MODEL", "model"),
+                            ("judge_base_url", "PROMPTREGRESS_JUDGE_BASE_URL", "base_url"),
+                            ("judge_api_key", "PROMPTREGRESS_JUDGE_API_KEY", "api_key")):
+        value = getattr(args, flag, None) or os.environ.get(env, "").strip() or None
+        if value:
+            given[name] = value
+    if not given:
+        return None
+    kw = _model_kw(args)
+    # a judge at another address must not receive the model's key
+    if "base_url" in given and "api_key" not in given:
+        kw.pop("api_key", None)
+    kw.update(given)
+    return kw
+
+
+def _prices(args) -> dict | None:
+    out = {}
+    for flag, env, name in (("price_in", "PROMPTREGRESS_PRICE_IN", "price_in"),
+                            ("price_out", "PROMPTREGRESS_PRICE_OUT", "price_out")):
+        value = getattr(args, flag, None)
+        if value is None and os.environ.get(env, "").strip():
+            try:
+                value = float(os.environ[env])
+            except ValueError:
+                value = None
+        if value is not None:
+            out[name] = value
+    return out or None
 
 
 INIT_PROMPT_V1 = """Classify the sentiment of the following review.
@@ -348,7 +409,8 @@ def _run_or_error(root, name, version, args, cases=None):
     try:
         results, _ = runner_mod.run_suite(
             root, name, version, cases=cases, model_kw=_model_kw(args),
-            use_cache=_use_cache(args))
+            use_cache=_use_cache(args), jobs=getattr(args, "jobs", 1),
+            judge_model_kw=_judge_kw(args), prices=_prices(args))
     except (OSError, ValueError) as e:
         print(f"error: {runner_mod.error_text(e)}", file=sys.stderr)
         return None, 2
@@ -385,6 +447,12 @@ def cmd_run(args) -> int:
         if results is None:
             return rc
         suites.append((name, version, results))
+    if args.format in ("junit", "sarif"):
+        if args.format == "junit":
+            print(report_mod.junit_xml(suites), end="")
+        else:
+            print(report_mod.sarif_text(suites, VERSION, root), end="")
+        return 0 if all(x.passed for _, _, r in suites for x in r) else 1
     if args.format == "json":
         if not args.all:
             name, version, results = suites[0]
@@ -433,14 +501,19 @@ def cmd_diff(args) -> int:
             "v1": "pass" if a.passed else "FAIL",
             "v2": "pass" if b.passed else "FAIL",
             "changed": a.passed != b.passed,
+            "regressed": a.passed and not b.passed,
             # before/after output text on flips (truncated like run's)
             "v1_output": a.output[:300],
             "v2_output": b.output[:300],
         })
+    regressed = [r for r in rows if r["regressed"]]
+    # 1 only when asked to judge, and only for a pass that became a FAIL
+    rc = 1 if args.fail_on_flip and regressed else 0
     if args.format == "json":
         print(json.dumps({"prompt": args.prompt, "v1": args.v1,
-                          "v2": args.v2, "cases": rows}, indent=2))
-        return 0
+                          "v2": args.v2, "cases": rows,
+                          "regressions": len(regressed)}, indent=2))
+        return rc
     w = max([len(r["name"]) for r in rows] + [4])
     print(f"{'case':<{w}}  {args.v1:>6}  {args.v2:>6}")
     for r in rows:
@@ -453,7 +526,51 @@ def cmd_diff(args) -> int:
         print(f"  {args.v2} output: {r['v2_output']!r}")
     print(f"\n{len(flipped)}/{len(rows)} case(s) changed verdict "
           f"{args.v1} -> {args.v2}")
-    return 0
+    if args.fail_on_flip:
+        if regressed:
+            print(f"{len(regressed)} case(s) went from pass to FAIL "
+                  f"({args.v1} -> {args.v2}): failing, as --fail-on-flip "
+                  "asked")
+        else:
+            print("no case went from pass to FAIL")
+    return rc
+
+
+def cmd_guard(args) -> int:
+    changed_given = args.changed_files is not None
+    if changed_given and args.since is not None:
+        print("error: give --changed-files or --since, not both",
+              file=sys.stderr)
+        return 2
+    try:
+        if changed_given:
+            changed = guard_mod.split_changed(args.changed_files)
+        else:
+            changed = guard_mod.git_changed(args.root, args.since or "HEAD")
+    except guard_mod.GuardError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    def cases_exist(name):
+        return os.path.isfile(os.path.join(
+            args.root, suite_mod.PROMPTS_DIR, f"{name}.cases.yaml"))
+
+    problems = guard_mod.check(changed, cases_exist)
+    if args.format == "json":
+        print(json.dumps({"changed_files": len(changed), "ok": not problems,
+                          "problems": problems}, indent=2))
+        return 1 if problems else 0
+    if not problems:
+        print(f"ok: no prompt changed without its cases "
+              f"({len(changed)} changed file(s) looked at)")
+        return 0
+    print(f"{len(problems)} prompt file(s) changed without their cases:\n")
+    for p in problems:
+        print(f"  {p['prompt_file']} changed, but {p['cases_file']} did not"
+              + ("" if p["cases_exist"] else " (and does not exist yet)"))
+    print("\nAdd or update a case that exercises the new wording, in the "
+          "cases file named above.")
+    return 1
 
 
 def _flag(parse):
@@ -494,12 +611,62 @@ def _add_model_options(p: argparse.ArgumentParser, *, on_subcommand: bool) -> No
                         f"{model_mod.DEFAULT_MAX_REPLY_BYTES}, 8 MiB; env "
                         f"PROMPTREGRESS_MAX_REPLY_BYTES). A bigger reply is "
                         f"an error; it is never read into memory.")
+    p.add_argument("--judge-model", default=d,
+                   help="Model for `judge:` assertions (env "
+                        "PROMPTREGRESS_JUDGE_MODEL); default: the model under test.")
+    p.add_argument("--judge-base-url", default=d,
+                   help="Endpoint for `judge:` assertions (env "
+                        "PROMPTREGRESS_JUDGE_BASE_URL). The model's API key is "
+                        "NOT sent there; use --judge-api-key / "
+                        "PROMPTREGRESS_JUDGE_API_KEY.")
+    p.add_argument("--judge-api-key", default=d,
+                   help="API key for the judge (env PROMPTREGRESS_JUDGE_API_KEY "
+                        "is safer than a flag).")
+    p.add_argument("--retries", type=_flag(model_mod.parse_retries), default=d,
+                   metavar="N",
+                   help=f"Ask again up to N times (0 to {model_mod.MAX_RETRIES}) "
+                        f"after HTTP 429/500/502/503/504, waiting 1, 2, 4 ... "
+                        f"seconds (or the server's Retry-After), at most "
+                        f"{model_mod.MAX_BACKOFF:g} s each (default 2; env "
+                        f"PROMPTREGRESS_RETRIES).")
+    p.add_argument("--insecure-http", action="store_true",
+                   default=argparse.SUPPRESS if on_subcommand else False,
+                   help="Allow sending a real API key over plain http:// to a "
+                        "non-local address (env PROMPTREGRESS_INSECURE_HTTP=1). "
+                        "Refused by default.")
+    p.add_argument("--price-in", type=float, default=d, metavar="USD",
+                   help="US dollars per million prompt tokens, for "
+                        "`max_cost_usd` assertions (env PROMPTREGRESS_PRICE_IN).")
+    p.add_argument("--price-out", type=float, default=d, metavar="USD",
+                   help="US dollars per million reply tokens (env "
+                        "PROMPTREGRESS_PRICE_OUT).")
     p.add_argument("--demo", action="store_true",
                    default=argparse.SUPPRESS if on_subcommand else False,
                    help="Trial mode: run against the built-in in-process "
                         "fake model instead of a real endpoint. "
                         "Scaffolds the example prompts if the requested "
                         "prompt is missing.")
+
+
+def _jobs(text):
+    try:
+        n = int(text)
+    except ValueError:
+        n = 0
+    if not 1 <= n <= runner_mod.MAX_JOBS:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a number of requests between 1 and "
+            f"{runner_mod.MAX_JOBS}")
+    return n
+
+
+def _add_jobs_option(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--jobs", "-j", type=_jobs, default=1, metavar="N",
+                   help=f"Send N model requests at once (1 to "
+                        f"{runner_mod.MAX_JOBS}; default 1). The report "
+                        f"reads the same as with 1, in case order. Raise it "
+                        f"only as far as your model server and its rate "
+                        f"limit allow.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -524,7 +691,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Run every prompt against each of its versions and "
                         "print a summary table; exit 1 if any case fails.")
     r.add_argument("--no-cache", action="store_true")
-    r.add_argument("--format", choices=["human", "json"], default="human")
+    r.add_argument("--format", choices=["human", "json", "junit", "sarif"],
+                   default="human",
+                   help="human text (default), JSON, JUnit XML for CI test "
+                        "reports, or a SARIF 2.1.0 log of the failures.")
+    _add_jobs_option(r)
     _add_model_options(r, on_subcommand=True)
 
     d = sub.add_parser(
@@ -542,63 +713,118 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--prompt", required=True)
     d.add_argument("--no-cache", action="store_true")
     d.add_argument("--format", choices=["human", "json"], default="human")
+    d.add_argument("--fail-on-flip", action="store_true",
+                   help="Exit 1 when a case that passed with v1 fails with "
+                        "v2 (a regression). A case that went from FAIL to "
+                        "pass is a fix and never fails the command.")
+    _add_jobs_option(d)
     _add_model_options(d, on_subcommand=True)
+
+    g = sub.add_parser(
+        "guard", help="Fail if a prompt file changed but its cases file "
+                      "did not.",
+        description="Fail when a prompt file (prompts/NAME.vN.txt) changed "
+                    "and its cases file (prompts/NAME.cases.yaml) did not: "
+                    "a reworded prompt should come with a case that checks "
+                    "the new wording. Runs no model. Give the changed files "
+                    "with --changed-files, or let git list them (--since, "
+                    "default HEAD: everything changed or new in the working "
+                    "tree). Exit 0 ok, 1 a prompt changed alone, 2 could "
+                    "not tell.")
+    g.add_argument("--changed-files", action="append", metavar="A,B",
+                   help="Changed files, relative to --root, separated by "
+                        "commas or newlines (repeatable).")
+    g.add_argument("--since", metavar="REF", default=None,
+                   help="Ask git: files changed against this ref (and new "
+                        "files). Default HEAD.")
+    g.add_argument("--format", choices=["human", "json"], default="human")
     return p
 
 
 def main(argv=None) -> int:
     _harden_streams()
+    reported = [False]
     with contextlib.ExitStack() as stack:
         # `... | head -1` must neither traceback nor change the exit code.
-        stack.enter_context(_closed_pipe_tolerant())
-        args = build_parser().parse_args(argv)
-        # Resources a subcommand opens (the demo's scaffold dir) are
-        # released here, however the command ends.
-        args.cleanup = stack
-        if args.demo and args.cmd in ("run", "diff"):
-            # Zero-dependency trial: ALWAYS the in-process fake model.
-            # A PROMPTREGRESS_BASE_URL left in the environment (or a
-            # --base-url) used to win silently and hit a real server.
-            demo_server, url = demo_mod.start_demo_model()
-            stack.callback(demo_server.server_close)   # runs after shutdown
-            stack.callback(demo_server.shutdown)
-            ignored = [f"--base-url {args.base_url}"] if args.base_url else []
-            if os.environ.get("PROMPTREGRESS_BASE_URL"):
-                ignored.append("PROMPTREGRESS_BASE_URL="
-                               f"{os.environ['PROMPTREGRESS_BASE_URL']}")
-            if ignored:
-                print("(demo: using the built-in fake model; ignoring "
-                      f"{', '.join(ignored)})", file=sys.stderr)
-            args.base_url = url
-            # the fake model has no use for a key, and one left in the real
-            # environment (even a broken one) is none of its business; nor
-            # are the limits the environment sets
-            args.api_key = "demo"
-            if args.timeout is None:
-                args.timeout = model_mod.DEFAULT_TIMEOUT
-            if args.max_reply_bytes is None:
-                args.max_reply_bytes = model_mod.DEFAULT_MAX_REPLY_BYTES
-        elif args.cmd in ("run", "diff"):
-            # a key that cannot be sent, a limit that is not a number: a
-            # configuration error. Say so before the first request, whether
-            # or not the cache could have answered
-            try:
-                model_mod.check_key(model_mod.resolve_api_key(args.api_key))
-                model_mod.resolve_timeout(args.timeout)
-                model_mod.resolve_max_reply_bytes(args.max_reply_bytes)
-            except model_mod.ModelError as e:
-                print(f"error: {e}", file=sys.stderr)
-                return 2
-        runner_mod.reset_cache_warnings()
+        state = stack.enter_context(_closed_pipe_tolerant())
+        rc = _run(argv, stack, reported)
+    if state.write_error is not None:
+        # The output could not be written (found when the streams were
+        # flushed): the report never arrived. Exit 2 and one line.
+        if not reported[0]:
+            e = state.write_error
+            _say_error("error: could not write the output: "
+                       f"{getattr(e, 'strerror', None) or e}")
+        return 2
+    return rc
+
+
+def _run(argv, stack, reported) -> int:
+    args = build_parser().parse_args(argv)
+    # Resources a subcommand opens (the demo's scaffold dir) are
+    # released here, however the command ends.
+    args.cleanup = stack
+    if args.demo and args.cmd in ("run", "diff"):
+        # Zero-dependency trial: ALWAYS the in-process fake model.
+        # A PROMPTREGRESS_BASE_URL left in the environment (or a
+        # --base-url) used to win silently and hit a real server.
+        demo_server, url = demo_mod.start_demo_model()
+        stack.callback(demo_server.server_close)   # runs after shutdown
+        stack.callback(demo_server.shutdown)
+        shown = model_mod._without_userinfo
+        ignored = ([f"--base-url {shown(args.base_url)}"]
+                   if args.base_url else [])
+        if os.environ.get("PROMPTREGRESS_BASE_URL"):
+            ignored.append("PROMPTREGRESS_BASE_URL="
+                           f"{shown(os.environ['PROMPTREGRESS_BASE_URL'])}")
+        if ignored:
+            print("(demo: using the built-in fake model; ignoring "
+                  f"{', '.join(ignored)})", file=sys.stderr)
+        args.base_url = url
+        # the fake model has no use for a key, and one left in the real
+        # environment (even a broken one) is none of its business; nor
+        # are the limits the environment sets
+        args.api_key = "demo"
+        if args.timeout is None:
+            args.timeout = model_mod.DEFAULT_TIMEOUT
+        if args.max_reply_bytes is None:
+            args.max_reply_bytes = model_mod.DEFAULT_MAX_REPLY_BYTES
+    elif args.cmd in ("run", "diff"):
+        # a key that cannot be sent, a limit that is not a number: a
+        # configuration error. Say so before the first request, whether
+        # or not the cache could have answered
         try:
-            return {"init": cmd_init, "list": cmd_list,
-                    "run": cmd_run, "diff": cmd_diff}[args.cmd](args)
-        except OSError as e:
-            # whatever file trouble nothing above handled (an unreadable
-            # prompts folder ...): one line and exit 2, never a traceback
-            # and never the 1 that means "a case failed"
-            print(f"error: {runner_mod.error_text(e)}", file=sys.stderr)
+            model_mod.check_key(model_mod.resolve_api_key(args.api_key))
+            model_mod.resolve_timeout(args.timeout)
+            model_mod.resolve_max_reply_bytes(args.max_reply_bytes)
+        except model_mod.ModelError as e:
+            print(f"error: {e}", file=sys.stderr)
             return 2
+    runner_mod.reset_cache_warnings()
+    try:
+        return {"init": cmd_init, "list": cmd_list,
+                "run": cmd_run, "diff": cmd_diff,
+                "guard": cmd_guard}[args.cmd](args)
+    except OSError as e:
+        # whatever file trouble nothing above handled (an unreadable
+        # prompts folder ...): one line and exit 2, never a traceback
+        # and never the 1 that means "a case failed"
+        reported[0] = _say_error(f"error: {runner_mod.error_text(e)}")
+        return 2
+
+
+def _say_error(message: str) -> bool:
+    """One line on stderr, if stderr can take it. When it cannot (a full
+    disk, a closed descriptor) there is nobody to tell: the exit code 2 still
+    says "could not run", and it must not become a traceback with 1, which
+    means "a case failed"."""
+    try:
+        print(message, file=sys.stderr)
+        sys.stderr.flush()
+        return True
+    except (OSError, ValueError):
+        _discard_output(sys.stderr)
+        return False
 
 
 if __name__ == "__main__":

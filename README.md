@@ -4,6 +4,8 @@
 most LLM-ops failures. Version your prompts as files, keep golden cases in
 YAML, run them in CI, and diff versions A/B before you ship.
 
+**Limits:** It checks replies with simple rules (and, optionally, a second model as judge); it cannot prove a prompt is good, and a judge model can be wrong or be fooled by the reply it grades.
+
 Here is one caught before shipping — `sentiment.v2.txt` reworded the
 classifier and it started chatting instead of answering in one word:
 
@@ -38,6 +40,12 @@ Exit code 1, so CI blocks the merge. (Both outputs above are what
 ## Install
 
 Zero dependencies — Python 3.10+ stdlib only.
+
+```bash
+pip install promptregress
+```
+
+From source (the latest, unreleased code):
 
 ```bash
 pip install git+https://github.com/calasdan-sketch/promptregress
@@ -217,6 +225,14 @@ assertion fails that case with `bad assertion: ...`, it never crashes the run.
   have (`str`, `int`: write `string`, `integer`). The annotations `title`,
   `description`, `$schema`, `default` and `examples` are accepted and
   ignored.
+- What the checks are, exactly: `json_valid` and `schema` read strict JSON
+  (`NaN` and `Infinity` are refused as Python extensions) and a duplicate key
+  in an object is not an error (the last one wins, as in Python);
+  `type: integer` accepts `1.0` (JSON Schema does too). `regex` is Python's
+  `re.search`: `$` also matches before a final newline (`^neg$` finds
+  `neg\n`; use `\Z` for the very end), and your pattern runs with no time
+  limit, so a pattern like `(a+)+$` against a long reply can take very long.
+  Write patterns you would trust on any input.
 - `max_tokens` / `min_tokens` use a rough estimate of one token per 4
   characters - a guardrail, not a tokenizer. An empty or blank reply is 0
   tokens, so `min_tokens: 1` fails it.
@@ -229,6 +245,88 @@ assert:
       rubric: "Output must be exactly one word: positive, negative, or neutral."
 ```
 
+Judge hardening: the judge sees the reply inside a random fence and is told it
+is data, not instructions; the verdict counts only when the whole answer is
+`PASS` (optionally followed by `.` or `!`), anything else fails. Use another
+model or endpoint for the judge with `--judge-model`, `--judge-base-url` and
+`--judge-api-key`.
+
+Cost and latency budgets (deterministic, no judge): `max_cost_usd: 0.01` and
+`max_seconds: 5` assertions, plus `max_total_tokens`. Cost is estimated from
+the `--price-in` / `--price-out` USD-per-million-token values and the
+chars/4 token estimate; it is an estimate, not a bill.
+
+Sampling: a case may set `samples: 5` and `min_pass_rate: 0.8`; each sample is
+cached separately and the case passes when enough samples pass.
+
+## Faster runs, reports for CI, pytest, and the guard
+
+**`--jobs N`** (on `run` and `diff`) sends N requests at once: `promptregress
+run --all --jobs 4`. The default is 1 and the most is 64. Results are listed
+in case order whatever order the answers came in, so the report is the same
+as with `--jobs 1`; when the model cannot answer a case the run stops at the
+first such case in that order, as before (cases already in flight past it
+are dropped). Local servers such as Ollama often answer one request at a
+time anyway; hosted APIs have rate limits, and the tool does not slow itself
+down for them.
+
+**`run --format junit`** writes JUnit XML to stdout (one test suite per
+prompt version, one test case per case, a `<failure>` for each failing case),
+which CI systems show as a test report:
+
+```bash
+promptregress run --all --format junit > promptregress.xml
+```
+
+**`run --format sarif`** writes a SARIF 2.1.0 log, one result per failed
+assertion, at the case's line in its cases file, for GitHub code scanning
+(`github/codeql-action/upload-sarif`). Both formats exit 1 when a case failed,
+like the human report. Model text XML cannot hold (control characters) is
+replaced by U+FFFD.
+
+**pytest.** With pytest installed (`pip install "promptregress[pytest]"`),
+every golden case is a normal test:
+
+```bash
+pytest --promptregress                        # the latest version of each prompt
+pytest --promptregress --promptregress-version all
+pytest --promptregress --promptregress-demo   # the built-in fake model
+```
+
+Test ids look like `prompts/sentiment.cases.yaml::v2::angry review`. The model
+comes from the same `PROMPTREGRESS_*` environment variables (or
+`--promptregress-model`, `--promptregress-base-url`,
+`--promptregress-timeout`; the key only from `PROMPTREGRESS_API_KEY`). pytest
+finds the plugin by itself, but it does nothing without `--promptregress`:
+the cases call the model, which can cost money, so they never run by
+surprise. After the first case the model cannot answer, the remaining cases
+are skipped. pytest 7 or later. The plugin is the module
+`promptregress.pytest`; an installed promptregress registers it itself, so do
+not also pass `-p promptregress.pytest` (pytest refuses to load it twice). Only
+from a source checkout that is not installed is `-p promptregress.pytest`
+needed.
+
+**`promptregress guard`** fails when a prompt changed but nothing that
+checks it did:
+
+```bash
+promptregress guard --since origin/main
+promptregress guard --changed-files prompts/sentiment.v2.txt,README.md
+```
+
+A prompt file is `prompts/NAME.vN.txt`; the cases that check it are in
+`prompts/NAME.cases.yaml`. If a prompt file is changed (or is new) and its
+cases file is not, `guard` exits 1 and names both files. Cases changed without
+a prompt change are fine, and so are all other files. The changed files come
+from `--changed-files` (commas or newlines; paths relative to `--root`) or
+from git: `--since REF` (default `HEAD`: your uncommitted changes and new
+files) lists what differs from that ref, deleted files not counted. In a pull
+request check `--since "$(git merge-base origin/main HEAD)"` out with
+`fetch-depth: 0`. `guard` runs no model and needs no key. Exit 0 ok, 1 a
+prompt changed alone, 2 it could not tell (not a git repository, unknown ref).
+The guard checks that the cases file was touched, not that the new case is a
+good one.
+
 ## Model endpoint
 
 Zero dependencies — plain stdlib HTTP against any OpenAI-compatible API:
@@ -240,6 +338,10 @@ Zero dependencies — plain stdlib HTTP against any OpenAI-compatible API:
 | `PROMPTREGRESS_MODEL` | `llama3.1` | |
 | `PROMPTREGRESS_TIMEOUT` | `60` | seconds for one request, from connecting to the last byte of the reply: a deadline, however slowly the server sends |
 | `PROMPTREGRESS_MAX_REPLY_BYTES` | `8388608` | the largest reply body accepted (8 MiB); a bigger one is an error and is never read into memory |
+
+`--base-url` must be an `http://` or `https://` address with a host and
+without a user name or password (`file:`, `ftp:` and `data:` addresses are
+refused with exit 2; the key belongs in `PROMPTREGRESS_API_KEY`).
 
 Flags `--model`, `--base-url`, `--api-key`, `--timeout`, `--max-reply-bytes`
 (and `--demo`) override env; they are accepted before or after the subcommand
@@ -277,6 +379,12 @@ a usage error, exit 2 - in `PROMPTREGRESS_TIMEOUT` and
 not a number used to be ignored without a word).
 
 ## Caching
+
+Cache files are written atomically (temp file plus rename), and the cache stores
+model output verbatim, so keep `.promptregress/` out of version control if
+replies may hold sensitive text. HTTP 429 and 5xx are retried with capped
+backoff (`--retries`, default 3). An `http://` endpoint that is not loopback is
+refused when an API key is set, unless you pass `--insecure-http`.
 
 Responses are cached in `.promptregress/cache/` keyed by prompt text + case
 + model + base URL — `diff v1 v2` never pays twice and CI re-runs are cheap,
@@ -332,7 +440,7 @@ The same for the human report and `--format json`:
 | Code | Meaning |
 |---|---|
 | `0` | `run`: every case passed. `list`, `init`: done. `diff`: the comparison was made, whatever it shows |
-| `1` | `run`: at least one case failed |
+| `1` | `run`: at least one case failed. `diff --fail-on-flip`: a case went from pass to FAIL. `guard`: a prompt changed without its cases |
 | `2` | usage or configuration error, nothing judged: a prompt or cases file that is missing or malformed; a cases file with no cases (`case:` typed for `cases:`, `cases: []`, an empty file) or with a case or an assertion that cannot be used (see "Checked before anything runs"); a file that cannot be read or written (a prompt file you may not open; `init` in a read-only folder); an API key that cannot be sent (see Model endpoint); a model that cannot be used (unreachable, rejecting the call, redirecting). `list` exits 2 too when a cases file is invalid or unreadable. A response cache that cannot be written is not an error (see Caching) |
 
 A suite with nothing in it never passes: a CI job that ran no cases would
@@ -341,8 +449,10 @@ be green and test nothing.
 `diff` reports, it does not judge: it exits 0 whenever the comparison was
 made, flipped verdicts included - the example at the top of this page exits
 0 though a case regressed, because a flip can be a fix as well as a
-regression. Gate a build with `run` (or `run --all`); to act on a flip, read
-`changed` per case in `diff --format json`.
+regression. Gate a build with `run` (or `run --all`), or ask `diff` itself
+to judge with `--fail-on-flip`: it then exits 1 when a case went from pass to
+FAIL (a case that went from FAIL to pass never fails it). `diff --format json`
+has `changed` and `regressed` per case and `regressions` in total.
 
 Piping is safe: when the reader quits early (`promptregress run --all |
 head -5`) the output just stops, with no traceback, and the exit code is
@@ -361,8 +471,10 @@ in the file).
 
 This repo's own CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml))
 installs the package and runs the test suite on Ubuntu, Windows and macOS
-with Python 3.11, 3.12 and 3.13, plus Python 3.10 (the oldest supported)
-on Ubuntu.
+with Python 3.10 (the oldest supported), 3.12 and 3.14 (the newest); a
+second job builds the package, runs `twine check --strict` and installs the
+wheel in a clean environment. Pushing a `v*` tag publishes to PyPI
+([`release.yml`](.github/workflows/release.yml)).
 
 ## Limitations
 
@@ -383,9 +495,11 @@ What this tool does not do, so you do not find out the hard way:
 - `schema` is a mini validator and the cases file is read by a YAML subset
   parser. What they do not understand is refused with an error, never
   ignored.
-- Requests run one after the other; there is no parallel mode.
-- `diff` shows flipped verdicts but exits 0 (see Exit codes); `run` is what
-  fails a build.
+- Requests run one after the other unless you ask for more with `--jobs`;
+  it has no rate limiting of its own, so keep N within what your server and
+  your account allow.
+- `diff` shows flipped verdicts but exits 0 unless you pass `--fail-on-flip`
+  (see Exit codes); `run` is what fails a build.
 
 ## Why not Langfuse / LangSmith / Braintrust?
 
