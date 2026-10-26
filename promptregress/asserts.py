@@ -78,9 +78,42 @@ def _no_constant(name: str):
     raise ValueError(f"{name} is not valid JSON")
 
 
+#: Nesting deeper than this is not accepted as JSON. The limit is ours, not the
+#: interpreter's: how deep json.loads can go differs between Python versions
+#: (3.14 no longer fails at a deep reply), so a RecursionError cannot be relied on.
+MAX_JSON_DEPTH = 500
+
+
+def _too_deep(text: str) -> bool:
+    """Linear scan: does [ / { nesting (outside strings) exceed MAX_JSON_DEPTH?"""
+    depth = 0
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "[{":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                return True
+        elif ch in "]}":
+            depth -= 1
+    return False
+
+
 def loads(text: str):
     """json.loads, strictly: NaN, Infinity and -Infinity are Python
-    extensions, not JSON (a model that writes them has not written JSON)."""
+    extensions, not JSON (a model that writes them has not written JSON), and
+    nesting deeper than MAX_JSON_DEPTH is refused on every Python version."""
+    if _too_deep(text):
+        raise ValueError(f"nested deeper than {MAX_JSON_DEPTH} levels")
     return json.loads(text, parse_constant=_no_constant)
 
 

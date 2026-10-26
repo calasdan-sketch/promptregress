@@ -678,6 +678,12 @@ class TestJsonValidMeansWhatItSays(unittest.TestCase):
                                             r"json_valid: needs true or false"):
                     verdict(text, "{}")
 
+    def test_the_depth_limit_is_ours_and_a_string_full_of_brackets_is_fine(self):
+        ok = "[" * 400 + "]" * 400
+        self.assertTrue(verdict("json_valid: true", ok))
+        self.assertTrue(verdict("json_valid: true", '{"a": "' + "[" * 5000 + '\\" ]"}'))
+        self.assertFalse(verdict("json_valid: true", "[" * 501 + "]" * 501))
+
     def test_a_reply_nested_too_deep_for_json_is_not_valid_json(self):
         deep = "[" * 100000 + "]" * 100000
         self.assertFalse(verdict("json_valid: true", deep))

@@ -2,6 +2,8 @@
 
 ## 0.2.0
 
+- `json_valid` and `schema` refuse JSON nested deeper than 500 levels with a limit of their own; Python 3.14 with a normal-sized stack no longer raised RecursionError, so the same reply was valid on one machine and not on another.
+
 - `diff --fail-on-flip`: exit 1 when a case that passed with the first
   version fails with the second. A case that went from FAIL to pass is a fix
   and never fails the command. `diff --format json` gets `regressed` per case
