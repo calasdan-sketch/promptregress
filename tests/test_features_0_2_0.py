@@ -188,13 +188,14 @@ class TestJobs(unittest.TestCase):
             results, _ = runner_mod.run_suite(
                 root, "p", "v1", model_kw={"base_url": model.url},
                 use_cache=False, jobs=3)
-            took = time.perf_counter() - t0
+            took = time.perf_counter() - t0      # noqa: F841 (not asserted: runners vary)
         finally:
             model.close()
         self.assertGreaterEqual(model.peak, 2)
         self.assertLessEqual(model.peak, 3)
         self.assertEqual(len(results), 6)
-        self.assertLess(took, 6 * 0.15)   # one at a time would take 0.9 s
+        # No wall-clock limit (a slow Windows runner took 1.2 s): requests that
+        # were seen in flight together (peak >= 2 above) ran at the same time.
 
     def test_jobs_1_stays_one_at_a_time(self):
         model = SlowModel(delay=0.05)

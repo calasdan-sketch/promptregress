@@ -2,6 +2,8 @@
 
 ## 0.2.0
 
+- Tests only: the parallel-jobs test proves concurrency by the number of requests in flight, not by a wall-clock limit a slow runner can miss.
+
 - `json_valid` and `schema` refuse JSON nested deeper than 500 levels with a limit of their own; Python 3.14 with a normal-sized stack no longer raised RecursionError, so the same reply was valid on one machine and not on another.
 
 - `diff --fail-on-flip`: exit 1 when a case that passed with the first
