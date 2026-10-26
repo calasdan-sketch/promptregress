@@ -1,3 +1,4 @@
+include SECURITY.md
 # What setuptools leaves out of the sdist and the tests read: the CI workflow
 # and the example workflow (TestPythonVersionClaims). Every module under tests/
 # goes in, so an unpacked sdist runs its own tests.

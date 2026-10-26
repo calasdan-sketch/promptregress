@@ -46,3 +46,6 @@ promptregress = "promptregress.pytest"
 
 [tool.setuptools]
 packages = ["promptregress"]
+
+[tool.setuptools.package-data]
+promptregress = ["py.typed"]

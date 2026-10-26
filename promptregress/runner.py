@@ -11,11 +11,13 @@ judge outages are never cached: only real verdicts are stored.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -72,9 +74,11 @@ class CaseResult:
     cached: bool = False
     error: str = ""
     seconds: float = 0.0   # wall time of the case (reports only)
+    samples: int = 1       # model requests behind this result (`samples:`)
+    pass_rate: float | None = None   # share of samples that passed, when sampled
 
     def as_dict(self) -> dict:
-        return {
+        d = {
             "name": self.name, "passed": self.passed,
             "output": self.output, "cached": self.cached,
             "error": self.error,
@@ -82,6 +86,10 @@ class CaseResult:
                 {"assertion": a.assertion, "passed": a.passed,
                  "detail": a.detail} for a in self.assertions],
         }
+        if self.samples > 1:
+            d["samples"] = self.samples
+            d["pass_rate"] = self.pass_rate
+        return d
 
 
 def _cache_path(root: str, key: str) -> str:
@@ -133,8 +141,19 @@ def _cache_write(root: str, key: str, payload: dict) -> bool:
         with _cache_lock:
             os.makedirs(os.path.dirname(p), exist_ok=True)
             ensure_cache_ignored(root)
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
+        # Written beside the entry and moved into place: a run that is killed
+        # (or two runs at once) never leaves half an entry for the next one.
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p), prefix=".tmp-",
+                                   suffix=".json")
+        os.close(fd)
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            os.replace(tmp, p)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
     except OSError as e:
         with _cache_lock:
             if root in _cache_off:
@@ -167,35 +186,84 @@ def _judge_key(prompt_name: str, version: str, case_name: str,
 
 def run_case(root: str, prompt_name: str, version: str, prompt_text: str,
              case: dict, model_kw: dict, use_cache: bool = True,
-             judge_model_kw: dict | None = None) -> CaseResult:
+             judge_model_kw: dict | None = None,
+             prices: dict | None = None) -> CaseResult:
+    """Run one case. A case with `samples: N` asks the model N times and
+    passes when at least `min_pass_rate` of the samples pass all assertions
+    (default: all of them)."""
     started = time.perf_counter()
-    result = _run_case(root, prompt_name, version, prompt_text, case,
-                       model_kw, use_cache, judge_model_kw)
+    samples = int(case.get("samples") or 1)
+    if samples <= 1:
+        result = _run_sample(root, prompt_name, version, prompt_text, case,
+                             model_kw, use_cache, judge_model_kw, prices, 0)
+    else:
+        kw = dict(model_kw)
+        kw.setdefault("temperature", SAMPLE_TEMPERATURE)   # 0 would repeat itself
+        runs = []
+        for i in range(samples):
+            one = _run_sample(root, prompt_name, version, prompt_text, case,
+                              kw, use_cache, judge_model_kw, prices, i)
+            runs.append(one)
+            if one.error:
+                break
+        result = _combine(case, runs, samples)
     result.seconds = time.perf_counter() - started
     return result
 
 
-def _run_case(root: str, prompt_name: str, version: str, prompt_text: str,
-              case: dict, model_kw: dict, use_cache: bool = True,
-              judge_model_kw: dict | None = None) -> CaseResult:
+#: Temperature for a sampled case when none was asked for: the point of
+#: sampling is to see the spread.
+SAMPLE_TEMPERATURE = 0.7
+
+
+def _combine(case: dict, runs: list[CaseResult], samples: int) -> CaseResult:
+    failed_hard = next((r for r in runs if r.error), None)
+    if failed_hard is not None:
+        return dataclasses.replace(failed_hard, name=case["name"])
+    wanted = float(case.get("min_pass_rate") or 1.0)
+    passes = sum(1 for r in runs if r.passed)
+    rate = passes / samples
+    shown = next((r for r in runs if not r.passed), runs[0])
+    note = AssertionResult(
+        {"samples": samples}, rate >= wanted,
+        f"{passes} of {samples} samples passed ({rate:.0%}; needs {wanted:.0%})")
+    return CaseResult(
+        name=case["name"], passed=rate >= wanted, output=shown.output,
+        assertions=[note] + list(shown.assertions),
+        cached=all(r.cached for r in runs),
+        samples=samples, pass_rate=rate)
+
+
+def _run_sample(root: str, prompt_name: str, version: str, prompt_text: str,
+                case: dict, model_kw: dict, use_cache: bool = True,
+                judge_model_kw: dict | None = None,
+                prices: dict | None = None, sample: int = 0) -> CaseResult:
     model_name, base_url = _provider(model_kw)
     key = suite_mod.cache_key(prompt_name, version, prompt_text, case,
                               model_name, base_url)
+    if sample:
+        key = hashlib.sha256(f"{key}|sample{sample}|"
+                             f"{model_kw.get('temperature')}".encode()).hexdigest()[:32]
     cached = False
+    seconds = None
+    rendered = suite_mod.render(prompt_text, case["input"], case.get("vars"))
     if use_cache:
         hit = _cache_read(root, key)
         if hit is not None and isinstance(hit.get("output"), str):
             output, cached = hit["output"], True
+            if isinstance(hit.get("seconds"), (int, float)):
+                seconds = float(hit["seconds"])
     if not cached:
-        rendered = suite_mod.render(prompt_text, case["input"],
-                                    case.get("vars"))
+        t0 = time.perf_counter()
         try:
             output = model_mod.complete(rendered, **model_kw)
         except model_mod.ModelError as e:
             return CaseResult(name=case["name"], passed=False, output="",
                               assertions=[], error=str(e))
+        seconds = time.perf_counter() - t0
         if use_cache:  # same contract as judge verdicts: off = no I/O
-            _cache_write(root, key, {"output": output})
+            _cache_write(root, key, {"output": output, "seconds": seconds})
+    context = {"prompt": rendered, "seconds": seconds, **(prices or {})}
 
     results: list[AssertionResult] = []
     for assertion in case["assert"]:
@@ -210,18 +278,17 @@ def _run_case(root: str, prompt_name: str, version: str, prompt_text: str,
         if "judge" in assertion:
             spec = assertion["judge"]
             rubric = spec["rubric"] if isinstance(spec, dict) else spec
+            jkw = judge_model_kw or model_kw
             jkey = _judge_key(prompt_name, version, case["name"],
-                              output, rubric,
-                              "|".join(_provider(judge_model_kw or model_kw)))
+                              output, rubric, "|".join(_provider(jkw)))
             hit = _cache_read(root, jkey) if use_cache else None
             if hit is not None and "passed" in hit and "detail" in hit:
                 passed, detail = bool(hit["passed"]), str(hit["detail"])
             else:
                 try:
-                    passed, detail = model_mod.judge(
-                        output, rubric, **(judge_model_kw or model_kw))
+                    passed, detail = model_mod.judge(output, rubric, **jkw)
                 except model_mod.ModelError as e:
-                    # transient outage — report, never cache
+                    # transient outage - report, never cache
                     passed, detail = False, f"judge unavailable: {e}"
                 else:
                     if use_cache:
@@ -230,7 +297,7 @@ def _run_case(root: str, prompt_name: str, version: str, prompt_text: str,
             results.append(AssertionResult(assertion, passed, detail))
             continue
         try:
-            passed, detail = asserts_mod.evaluate(assertion, output)
+            passed, detail = asserts_mod.evaluate(assertion, output, context)
         except ValueError as e:
             passed, detail = False, f"bad assertion: {e}"
         results.append(AssertionResult(assertion, passed, detail))
@@ -257,7 +324,9 @@ def run_suite(root: str, prompt_name: str, version: str,
               model_kw: dict | None = None,
               use_cache: bool = True,
               fail_fast: bool = True,
-              jobs: int = 1) -> tuple[list[CaseResult], str]:
+              jobs: int = 1,
+              judge_model_kw: dict | None = None,
+              prices: dict | None = None) -> tuple[list[CaseResult], str]:
     """Run every case of prompt_name against `version`.
 
     fail_fast (default): the first case the model could not answer
@@ -284,7 +353,7 @@ def run_suite(root: str, prompt_name: str, version: str,
     if jobs == 1 or len(cases) < 2:
         for c in cases:
             r = run_case(root, prompt_name, version, prompt_text, c, kw,
-                         use_cache)
+                         use_cache, judge_model_kw, prices)
             results.append(r)
             if fail_fast and r.error:
                 break
@@ -293,7 +362,8 @@ def run_suite(root: str, prompt_name: str, version: str,
                               thread_name_prefix="promptregress-case")
     try:
         futures = [pool.submit(run_case, root, prompt_name, version,
-                               prompt_text, c, kw, use_cache)
+                               prompt_text, c, kw, use_cache, judge_model_kw,
+                               prices)
                    for c in cases]
         for future in futures:
             r = future.result()

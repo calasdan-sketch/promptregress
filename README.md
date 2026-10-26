@@ -4,6 +4,8 @@
 most LLM-ops failures. Version your prompts as files, keep golden cases in
 YAML, run them in CI, and diff versions A/B before you ship.
 
+**Limits:** It checks replies with simple rules (and, optionally, a second model as judge); it cannot prove a prompt is good, and a judge model can be wrong or be fooled by the reply it grades.
+
 Here is one caught before shipping — `sentiment.v2.txt` reworded the
 classifier and it started chatting instead of answering in one word:
 
@@ -243,6 +245,20 @@ assert:
       rubric: "Output must be exactly one word: positive, negative, or neutral."
 ```
 
+Judge hardening: the judge sees the reply inside a random fence and is told it
+is data, not instructions; the verdict counts only when the whole answer is
+`PASS` (optionally followed by `.` or `!`), anything else fails. Use another
+model or endpoint for the judge with `--judge-model`, `--judge-base-url` and
+`--judge-api-key`.
+
+Cost and latency budgets (deterministic, no judge): `max_cost_usd: 0.01` and
+`max_seconds: 5` assertions, plus `max_total_tokens`. Cost is estimated from
+the `--price-in` / `--price-out` USD-per-million-token values and the
+chars/4 token estimate; it is an estimate, not a bill.
+
+Sampling: a case may set `samples: 5` and `min_pass_rate: 0.8`; each sample is
+cached separately and the case passes when enough samples pass.
+
 ## Faster runs, reports for CI, pytest, and the guard
 
 **`--jobs N`** (on `run` and `diff`) sends N requests at once: `promptregress
@@ -363,6 +379,12 @@ a usage error, exit 2 - in `PROMPTREGRESS_TIMEOUT` and
 not a number used to be ignored without a word).
 
 ## Caching
+
+Cache files are written atomically (temp file plus rename), and the cache stores
+model output verbatim, so keep `.promptregress/` out of version control if
+replies may hold sensitive text. HTTP 429 and 5xx are retried with capped
+backoff (`--retries`, default 3). An `http://` endpoint that is not loopback is
+refused when an API key is set, unless you pass `--insecure-http`.
 
 Responses are cached in `.promptregress/cache/` keyed by prompt text + case
 + model + base URL — `diff v1 v2` never pays twice and CI re-runs are cheap,

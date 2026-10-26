@@ -2,6 +2,11 @@
 
 ## 0.2.0
 
+- Judge: `--judge-model/--judge-base-url/--judge-api-key` are now wired through; the verdict must be exactly `PASS`; the judge prompt fences the reply with a random token and says it is data.
+- `http://` to a non-loopback host with an API key is refused unless `--insecure-http`; 429/5xx are retried with capped backoff (`--retries`).
+- Cases take `samples:` and `min_pass_rate:`; budget assertions `max_cost_usd`, `max_seconds`, `max_total_tokens` (with `--price-in/--price-out`).
+- Cache writes are atomic. SECURITY.md, `py.typed`, `__version__`, release job now needs the tests.
+
 - Tests only: the parallel-jobs test proves concurrency by the number of requests in flight, not by a wall-clock limit a slow runner can miss.
 
 - `json_valid` and `schema` refuse JSON nested deeper than 500 levels with a limit of their own; Python 3.14 with a normal-sized stack no longer raised RecursionError, so the same reply was valid on one machine and not on another.

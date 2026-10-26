@@ -35,6 +35,7 @@ import os
 import sys
 import tempfile
 
+from . import __version__
 from . import demo as demo_mod
 from . import guard as guard_mod
 from . import model as model_mod
@@ -42,7 +43,7 @@ from . import report as report_mod
 from . import runner as runner_mod
 from . import suite as suite_mod
 
-VERSION = "0.2.0"
+VERSION = __version__
 
 
 def _harden_streams() -> None:
@@ -178,11 +179,50 @@ def _closed_pipe_tolerant():
 def _model_kw(args) -> dict:
     kw: dict = {}
     for name in ("model", "base_url", "api_key", "timeout",
-                 "max_reply_bytes"):
+                 "max_reply_bytes", "retries"):
         val = getattr(args, name, None)
         if val is not None:
             kw[name] = val
+    if getattr(args, "insecure_http", None):
+        kw["insecure_http"] = True
     return kw
+
+
+def _judge_kw(args) -> dict | None:
+    """The judge's own endpoint: --judge-model / --judge-base-url /
+    --judge-api-key (env PROMPTREGRESS_JUDGE_MODEL / _BASE_URL / _API_KEY),
+    everything else as for the model under test. None when none is given: the
+    judge is then the same model."""
+    given = {}
+    for flag, env, name in (("judge_model", "PROMPTREGRESS_JUDGE_MODEL", "model"),
+                            ("judge_base_url", "PROMPTREGRESS_JUDGE_BASE_URL", "base_url"),
+                            ("judge_api_key", "PROMPTREGRESS_JUDGE_API_KEY", "api_key")):
+        value = getattr(args, flag, None) or os.environ.get(env, "").strip() or None
+        if value:
+            given[name] = value
+    if not given:
+        return None
+    kw = _model_kw(args)
+    # a judge at another address must not receive the model's key
+    if "base_url" in given and "api_key" not in given:
+        kw.pop("api_key", None)
+    kw.update(given)
+    return kw
+
+
+def _prices(args) -> dict | None:
+    out = {}
+    for flag, env, name in (("price_in", "PROMPTREGRESS_PRICE_IN", "price_in"),
+                            ("price_out", "PROMPTREGRESS_PRICE_OUT", "price_out")):
+        value = getattr(args, flag, None)
+        if value is None and os.environ.get(env, "").strip():
+            try:
+                value = float(os.environ[env])
+            except ValueError:
+                value = None
+        if value is not None:
+            out[name] = value
+    return out or None
 
 
 INIT_PROMPT_V1 = """Classify the sentiment of the following review.
@@ -369,7 +409,8 @@ def _run_or_error(root, name, version, args, cases=None):
     try:
         results, _ = runner_mod.run_suite(
             root, name, version, cases=cases, model_kw=_model_kw(args),
-            use_cache=_use_cache(args), jobs=getattr(args, "jobs", 1))
+            use_cache=_use_cache(args), jobs=getattr(args, "jobs", 1),
+            judge_model_kw=_judge_kw(args), prices=_prices(args))
     except (OSError, ValueError) as e:
         print(f"error: {runner_mod.error_text(e)}", file=sys.stderr)
         return None, 2
@@ -570,6 +611,35 @@ def _add_model_options(p: argparse.ArgumentParser, *, on_subcommand: bool) -> No
                         f"{model_mod.DEFAULT_MAX_REPLY_BYTES}, 8 MiB; env "
                         f"PROMPTREGRESS_MAX_REPLY_BYTES). A bigger reply is "
                         f"an error; it is never read into memory.")
+    p.add_argument("--judge-model", default=d,
+                   help="Model for `judge:` assertions (env "
+                        "PROMPTREGRESS_JUDGE_MODEL); default: the model under test.")
+    p.add_argument("--judge-base-url", default=d,
+                   help="Endpoint for `judge:` assertions (env "
+                        "PROMPTREGRESS_JUDGE_BASE_URL). The model's API key is "
+                        "NOT sent there; use --judge-api-key / "
+                        "PROMPTREGRESS_JUDGE_API_KEY.")
+    p.add_argument("--judge-api-key", default=d,
+                   help="API key for the judge (env PROMPTREGRESS_JUDGE_API_KEY "
+                        "is safer than a flag).")
+    p.add_argument("--retries", type=_flag(model_mod.parse_retries), default=d,
+                   metavar="N",
+                   help=f"Ask again up to N times (0 to {model_mod.MAX_RETRIES}) "
+                        f"after HTTP 429/500/502/503/504, waiting 1, 2, 4 ... "
+                        f"seconds (or the server's Retry-After), at most "
+                        f"{model_mod.MAX_BACKOFF:g} s each (default 2; env "
+                        f"PROMPTREGRESS_RETRIES).")
+    p.add_argument("--insecure-http", action="store_true",
+                   default=argparse.SUPPRESS if on_subcommand else False,
+                   help="Allow sending a real API key over plain http:// to a "
+                        "non-local address (env PROMPTREGRESS_INSECURE_HTTP=1). "
+                        "Refused by default.")
+    p.add_argument("--price-in", type=float, default=d, metavar="USD",
+                   help="US dollars per million prompt tokens, for "
+                        "`max_cost_usd` assertions (env PROMPTREGRESS_PRICE_IN).")
+    p.add_argument("--price-out", type=float, default=d, metavar="USD",
+                   help="US dollars per million reply tokens (env "
+                        "PROMPTREGRESS_PRICE_OUT).")
     p.add_argument("--demo", action="store_true",
                    default=argparse.SUPPRESS if on_subcommand else False,
                    help="Trial mode: run against the built-in in-process "

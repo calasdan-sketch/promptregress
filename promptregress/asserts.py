@@ -222,10 +222,13 @@ def _check_schema(data, schema: dict, path: str = "$") -> list[str]:
 
 TEXT_KINDS = ("contains", "not_contains", "regex", "not_regex",
               "starts_with", "ends_with")
-COUNT_KINDS = ("max_tokens", "min_tokens")
+COUNT_KINDS = ("max_tokens", "min_tokens", "max_total_tokens")
+#: Budgets: the reply must stay under a cost in US dollars / a time in seconds.
+BUDGET_KINDS = ("max_cost_usd", "max_seconds")
 #: Every assertion name. `judge` is put to a model by the runner; evaluate()
 #: decides all the others itself.
-KINDS = TEXT_KINDS + ("json_valid", "schema") + COUNT_KINDS + ("judge",)
+KINDS = (TEXT_KINDS + ("json_valid", "schema") + COUNT_KINDS + BUDGET_KINDS
+         + ("judge",))
 
 
 def as_text(value, where: str) -> str:
@@ -284,6 +287,21 @@ def _count(kind: str, want) -> int:
         raise ValueError(f"{kind}: needs a whole number (0 or more), "
                          f"got {want!r}")
     return number
+
+
+def _amount(kind: str, want) -> float:
+    """The positive-number operand of a budget assertion."""
+    if (isinstance(want, bool) or not isinstance(want, (int, float))
+            or not 0 < want < float("inf")):
+        if isinstance(want, str):
+            try:
+                value = float(want.strip())
+            except ValueError:
+                value = None
+            if value is not None and 0 < value < float("inf"):
+                return value
+        raise ValueError(f"{kind}: needs a number above 0, got {want!r}")
+    return float(want)
 
 
 def _pattern(kind: str, want) -> re.Pattern:
@@ -349,6 +367,8 @@ def check(assertion) -> dict:
         return {kind: text}
     if kind in COUNT_KINDS:
         return {kind: _count(kind, want)}
+    if kind in BUDGET_KINDS:
+        return {kind: _amount(kind, want)}
     if kind == "json_valid":
         return {kind: _flag(kind, want)}
     if kind == "schema":
@@ -357,9 +377,15 @@ def check(assertion) -> dict:
     return {kind: _judge(want)}
 
 
-def evaluate(assertion: dict, output: str) -> tuple[bool, str]:
+def evaluate(assertion: dict, output: str,
+             context: "dict | None" = None) -> tuple[bool, str]:
     """Decide one assertion about a reply: (passed, detail). ValueError when
-    the assertion itself cannot be used (see check)."""
+    the assertion itself cannot be used (see check).
+
+    `context` (the runner fills it in) carries what the budget assertions
+    need: `prompt` (the text that was sent), `seconds` (how long the model
+    took) and `price_in` / `price_out` (US dollars per million tokens)."""
+    context = context or {}
     kind, want = next(iter(check(assertion).items()))
 
     if kind == "contains":
@@ -412,5 +438,25 @@ def evaluate(assertion: dict, output: str) -> tuple[bool, str]:
     if kind == "min_tokens":
         n = estimate_tokens(output)
         return n >= want, f"~{n} tokens (min {want})"
+    if kind == "max_total_tokens":
+        sent = estimate_tokens(context.get("prompt") or "")
+        got = estimate_tokens(output)
+        return (sent + got <= want,
+                f"~{sent + got} tokens in all (~{sent} sent + ~{got} back; max {want})")
+    if kind == "max_cost_usd":
+        price_in, price_out = context.get("price_in"), context.get("price_out")
+        if price_in is None and price_out is None:
+            return False, ("cannot price the call: give --price-in / --price-out "
+                           "(US dollars per million tokens), or drop max_cost_usd")
+        sent = estimate_tokens(context.get("prompt") or "")
+        got = estimate_tokens(output)
+        cost = (sent * (price_in or 0.0) + got * (price_out if price_out is not None
+                                                   else (price_in or 0.0))) / 1e6
+        return cost <= want, f"~${cost:.6f} estimated (max ${want:g}; token counts are rough)"
+    if kind == "max_seconds":
+        seconds = context.get("seconds")
+        if seconds is None:
+            return False, "no timing for this reply (cache entry written by an older version); run with --no-cache"
+        return seconds <= want, f"{seconds:.2f}s (max {want:g}s)"
     raise ValueError(f"{kind}: is put to a model by the runner; it is not "
                      f"decided here")
